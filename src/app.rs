@@ -25,6 +25,7 @@ struct Entry {
 
 enum Status {
     Idle,
+    Cancelled,
     Busy(String),
     Done { path: PathBuf },
     Error(String),
@@ -49,8 +50,11 @@ pub struct App {
     warnings: Vec<String>,
     worker: Option<Worker>,
     incoming: Option<Receiver<Vec<PathBuf>>>,
-    /// Файлы, пришедшие во время работы (проводник, перетаскивание): `bool` — отсортировать пачку по имени.
-    pending: Vec<(Vec<PathBuf>, bool)>,
+    /// Файлы, пришедшие во время работы (перетаскивание, диалог выбора).
+    pending: Vec<Vec<PathBuf>>,
+    /// Файлы из проводника: пока они приходят пачками по одному, ждём «тишины» и сортируем всю группу целиком.
+    shell_group: Vec<PathBuf>,
+    shell_last: Option<Instant>,
     menu: Option<MenuState>,
     menu_rx: Option<Receiver<Result<MenuState, String>>>,
     show_settings: bool,
@@ -71,6 +75,8 @@ impl App {
             worker: None,
             incoming,
             pending: vec![],
+            shell_group: vec![],
+            shell_last: None,
             menu: None,
             menu_rx: None,
             show_settings: false,
@@ -78,7 +84,8 @@ impl App {
             last_output: None,
         };
         if !initial.is_empty() {
-            app.pending.push((initial, true));
+            app.shell_group = initial;
+            app.shell_last = Some(Instant::now());
         }
         app
     }
@@ -94,7 +101,7 @@ impl App {
     // ───────────── список файлов ─────────────
 
     /// Добавляет файлы; возвращает сообщения об отклонённых файлах.
-    fn add(&mut self, paths: Vec<PathBuf>, sort_batch: bool) {
+    fn add(&mut self, paths: Vec<PathBuf>, sort_batch: bool) -> Vec<String> {
         let first_new = self.entries.len();
         let mut problems: Vec<String> = vec![];
         for path in paths {
@@ -118,8 +125,13 @@ impl App {
                         continue;
                     }
                     Ok(s) => s.into_iter().map(|i| SheetItem { selected: !i.hidden, name: i.name, hidden: i.hidden }).collect(),
+                    // HTML/XML-выгрузка под видом .xls: календарь листов узнаем после конвертации.
+                    Err(_) if job::sniff(&path).is_ok_and(|f| f == job::Sniffed::Text) => {
+                        vec![SheetItem { name: "Данные".into(), hidden: false, selected: true }]
+                    }
                     Err(e) => {
-                        problems.push(format!("«{name}»: {e:#}"));
+                        let msg = format!("{e:#}");
+                        problems.push(if msg.starts_with('«') { msg } else { format!("«{name}»: {msg}") });
                         continue;
                     }
                 }
@@ -136,9 +148,7 @@ impl App {
         if self.entries.is_empty() {
             self.kind = None;
         }
-        if !problems.is_empty() {
-            self.error(problems.join("\n"));
-        }
+        problems
     }
 
     fn ready(&self) -> bool {
@@ -152,11 +162,12 @@ impl App {
     // ───────────── фоновые события ─────────────
 
     fn poll(&mut self, ctx: &egui::Context) {
-        // Файлы из проводника.
+        // Файлы из проводника приходят по одному на процесс — копим группу.
         let mut got = false;
         if let Some(rx) = &self.incoming {
             while let Ok(b) = rx.try_recv() {
-                self.pending.push((b, true));
+                self.shell_group.extend(b);
+                self.shell_last = Some(Instant::now());
                 got = true;
             }
         }
@@ -167,11 +178,24 @@ impl App {
         // Перетаскивание в окно.
         let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect());
         if !dropped.is_empty() {
-            self.pending.push((dropped, false));
+            self.pending.push(dropped);
         }
-        if !self.busy() && !self.pending.is_empty() {
-            for (batch, sort) in std::mem::take(&mut self.pending) {
-                self.add(batch, sort);
+        if !self.busy() {
+            let mut problems = vec![];
+            for batch in std::mem::take(&mut self.pending) {
+                problems.extend(self.add(batch, false));
+            }
+            if !self.shell_group.is_empty() {
+                if self.shell_last.is_some_and(|t| t.elapsed() >= Duration::from_millis(500)) {
+                    let group = std::mem::take(&mut self.shell_group);
+                    problems.extend(self.add(group, true));
+                    self.shell_last = None;
+                } else {
+                    ctx.request_repaint_after(Duration::from_millis(100));
+                }
+            }
+            if !problems.is_empty() {
+                self.error(problems.join("\n"));
             }
         }
 
@@ -208,6 +232,10 @@ impl App {
                         None => Status::Idle,
                     };
                 }
+                Err(e) if e == pdf::CANCELLED => {
+                    self.warnings.clear();
+                    self.status = Status::Cancelled;
+                }
                 Err(e) => {
                     self.warnings.clear();
                     self.error(e);
@@ -237,6 +265,7 @@ impl App {
 
     fn start_merge(&mut self, ctx: &egui::Context) {
         let Some(kind) = self.kind else { return };
+        self.shell_group.clear();
         let paths: Vec<PathBuf> = self.entries.iter().map(|e| e.path.clone()).collect();
         if job::needs_converter(self.target, &paths) && !pdf::available() {
             self.error(pdf::MISSING_HINT);
@@ -358,6 +387,7 @@ impl eframe::App for App {
                     ui.spinner();
                     if ui.button("Отмена").clicked() {
                         w.cancel.store(true, Ordering::Relaxed);
+                        self.status = Status::Busy("Отмена…".into());
                     }
                 }
             });
@@ -369,6 +399,9 @@ impl eframe::App for App {
             egui::ScrollArea::vertical().max_height(130.0).auto_shrink([false, true]).show(ui, |ui| {
                 match &self.status {
                     Status::Idle => {}
+                    Status::Cancelled => {
+                        ui.weak("Операция отменена");
+                    }
                     Status::Busy(m) => {
                         ui.add(egui::Label::new(m.as_str()).wrap());
                     }
@@ -413,7 +446,7 @@ impl eframe::App for App {
                         dlg = dlg.set_directory(d);
                     }
                     if let Some(p) = dlg.pick_files() {
-                        self.pending.push((p, false));
+                        self.pending.push(p);
                     }
                 }
                 if ui.add_enabled(!busy && !self.entries.is_empty(), egui::Button::new("Очистить")).clicked() {
@@ -491,12 +524,12 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self) {
-        // Закрыли окно во время работы: отменяем и даём конвертеру до 3 с, чтобы убрать за собой.
+        // Закрыли окно во время работы: отменяем и даём конвертеру до 8 с, чтобы убрать за собой.
         if let Some(w) = &mut self.worker {
             w.cancel.store(true, Ordering::Relaxed);
             let t = Instant::now();
             if let Some(h) = w.handle.take() {
-                while !h.is_finished() && t.elapsed() < Duration::from_secs(3) {
+                while !h.is_finished() && t.elapsed() < Duration::from_secs(8) {
                     std::thread::sleep(Duration::from_millis(50));
                 }
             }
@@ -522,7 +555,10 @@ impl App {
                 });
             }
             if self.menu == Some(MenuState::Stale) {
-                ui.colored_label(ui.visuals().warn_fg_color, "Пункт указывает на другую копию программы — включите галочку заново.");
+                ui.colored_label(ui.visuals().warn_fg_color, "Пункт указывает на другую копию программы (или записан не полностью).");
+                if ui.add_enabled(self.menu_rx.is_none(), egui::Button::new("Обновить пункт меню")).clicked() {
+                    self.toggle_menu(true);
+                }
             }
             if shell::menu_supported() {
                 ui.weak("Файлы Excel и Word → ПКМ → «Объединить файлы…». Права администратора не нужны.");

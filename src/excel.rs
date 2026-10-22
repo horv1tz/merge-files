@@ -1654,6 +1654,8 @@ struct StyleOut {
     table_styles: Vec<(String, String)>,
     default_table_style: Option<(String, String)>,
     indexed_colors: Option<String>,
+    /// Использует ли первая книга цвета из индексированной палитры (иначе различия палитр не важны).
+    first_uses_indexed: bool,
     started: bool,
 }
 
@@ -1837,14 +1839,20 @@ impl StyleOut {
                 self.table_styles.push((name, ser(&t2)));
             }
         }
+        let src_uses_indexed = uses_indexed(root);
+        if !self.started {
+            self.first_uses_indexed = src_uses_indexed;
+        }
         if let Some(ic) = root.child("colors").and_then(|c| c.child("indexedColors")) {
             let s = ser(ic);
             match &self.indexed_colors {
                 None if !self.started => self.indexed_colors = Some(s),
                 Some(cur) if *cur == s => {}
-                _ => warns.add(format!("«{label}»: в книге своя палитра индексированных цветов; цвета ячеек могут отличаться от оригинала")),
+                // Предупреждаем только если цвета из палитры действительно используются.
+                _ if src_uses_indexed || self.first_uses_indexed => warns.add(format!("«{label}»: в книге своя палитра индексированных цветов; цвета ячеек могут отличаться от оригинала")),
+                _ => {}
             }
-        } else if self.indexed_colors.is_some() {
+        } else if self.indexed_colors.is_some() && src_uses_indexed {
             warns.add(format!("«{label}»: у первой книги своя палитра индексированных цветов; цвета ячеек из «{label}» могут отличаться от оригинала"));
         }
         self.started = true;
@@ -2583,7 +2591,7 @@ struct SheetState {
 
 const NS_XM: &str = "http://schemas.microsoft.com/office/excel/2006/main";
 const URI_SPARKLINES: &str = "{05C60535-1F16-4fd2-B633-F4F36F0B64E0}";
-const URI_X14_CF: &str = "{78C0D931-6437-4328-A5C5-2E7C1D0A9C6D}";
+const URI_X14_CF: &str = "{78C0D931-6437-407d-A8EE-F0AAD7539E65}";
 const URI_X14_DV: &str = "{CCE6A557-97BC-4b89-ADB6-D9C93CAAB3DF}";
 
 fn inline_str(text: &str) -> xml::Elem {
@@ -3209,6 +3217,11 @@ pub struct Options {
     pub fit_to_width: bool,
 }
 
+/// Есть ли в стилях цвета из индексированной палитры (индексы 64 и выше — системные цвета).
+fn uses_indexed(el: &xml::Elem) -> bool {
+    el.attr("indexed").is_some_and(|v| v.parse::<u32>().is_ok_and(|n| n < 64)) || el.children().any(uses_indexed)
+}
+
 /// Лист рабочей книги.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SheetInfo {
@@ -3219,7 +3232,8 @@ pub struct SheetInfo {
 fn calamine_sheets(path: &Path) -> Result<Vec<SheetInfo>> {
     use calamine::{Reader, SheetType, SheetVisible, open_workbook_auto};
     let label = file_label(path);
-    let wb = open_workbook_auto(path).map_err(|e| anyhow!("«{label}»: не удалось прочитать книгу ({e})"))?;
+    let wb = open_workbook_auto(path)
+        .map_err(|_| anyhow!("«{label}»: не удалось прочитать книгу — файл повреждён, защищён паролем или имеет другой формат"))?;
     Ok(wb
         .sheets_metadata()
         .iter()

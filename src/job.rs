@@ -75,6 +75,8 @@ pub enum Sniffed {
     Ole,
     /// Другой zip-контейнер (например .ods).
     OtherZip,
+    /// Текстовый формат под видом .xls/.doc (HTML, SpreadsheetML 2003, RTF) — LibreOffice его откроет.
+    Text,
     Unknown,
 }
 
@@ -97,7 +99,13 @@ pub fn sniff(path: &Path) -> Result<Sniffed> {
     if n >= 8 && head == [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1] {
         return Ok(Sniffed::Ole);
     }
-    Ok(Sniffed::Unknown)
+    // Выгрузки из веб-систем и 1С часто имеют расширение .xls/.doc, но на деле HTML/XML/RTF.
+    let mut buf = [0u8; 512];
+    let mut f = std::fs::File::open(path)?;
+    let n = f.read(&mut buf)?;
+    let head = String::from_utf8_lossy(&buf[..n]).trim_start_matches('\u{feff}').trim_start().to_lowercase();
+    let texty = ["<html", "<!doctype html", "<?xml", "<table", "{\\rtf"].iter().any(|p| head.starts_with(p));
+    Ok(if texty { Sniffed::Text } else { Sniffed::Unknown })
 }
 
 /// Нужен ли LibreOffice/Office для этого задания (до выбора файла результата).
@@ -144,6 +152,41 @@ fn check_cancel(cancel: &AtomicBool) -> Result<()> {
     if cancel.load(Ordering::Relaxed) { Err(anyhow!("Операция отменена")) } else { Ok(()) }
 }
 
+/// Копия сконвертированного файла под исходным именем (с исходным расширением), чтобы в сообщениях
+/// фигурировало имя, которое выбрал пользователь, а не внутреннее.
+fn relabel(converted: &Path, original: &Path, tmp: &Path, i: usize) -> Result<PathBuf> {
+    let dir = tmp.join(format!("lbl{i}"));
+    std::fs::create_dir_all(&dir)?;
+    let to = dir.join(original.file_name().unwrap_or_default());
+    std::fs::copy(converted, &to)?;
+    Ok(to)
+}
+
+/// Имена выбранных листов в сконвертированной книге (по номерам листов исходного файла).
+fn converted_names(selected: &[usize], after: &[excel::SheetInfo], label: &str) -> Result<Vec<String>> {
+    selected
+        .iter()
+        .map(|&k| after.get(k).map(|s| s.name.clone()).ok_or_else(|| anyhow!("в «{label}» не найден лист №{}", k + 1)))
+        .collect()
+}
+
+/// Результат кладётся в итоговый файл целиком: сначала во временный файл рядом, затем переименованием.
+fn save_atomically(from: &Path, out: &Path) -> Result<()> {
+    let fail = |e: std::io::Error| {
+        anyhow!("Не удалось сохранить «{}»: {e}. Возможно, файл открыт в другой программе или нет прав на запись.", out.display())
+    };
+    let name = out.file_name().unwrap_or_default().to_string_lossy().into_owned();
+    let part = out.with_file_name(format!(".{name}.merge-part"));
+    if let Err(e) = std::fs::copy(from, &part) {
+        let _ = std::fs::remove_file(&part);
+        return Err(fail(e));
+    }
+    std::fs::rename(&part, out).map_err(|e| {
+        let _ = std::fs::remove_file(&part);
+        fail(e)
+    })
+}
+
 pub fn run(job: &Job, cancel: &AtomicBool, progress: &dyn Fn(&str)) -> Result<Outcome> {
     validate(job)?;
     let tmp = tempfile::Builder::new().prefix("merge-files-").tempdir().context("не удалось создать временную папку")?;
@@ -162,18 +205,14 @@ pub fn run(job: &Job, cancel: &AtomicBool, progress: &dyn Fn(&str)) -> Result<Ou
                 }
                 let (path, names) = match sniff(&e.path)? {
                     Sniffed::Xlsx => (e.path.clone(), e.selected.iter().map(|&k| e.all_sheets[k].clone()).collect()),
-                    Sniffed::Docx | Sniffed::Unknown => bail!("«{name}» не является книгой Excel"),
-                    Sniffed::Ole | Sniffed::OtherZip => {
+                    Sniffed::Docx | Sniffed::Unknown => bail!("«{name}» не является книгой Excel (файл повреждён или другого формата)"),
+                    Sniffed::Ole | Sniffed::OtherZip | Sniffed::Text => {
                         progress(&format!("Конвертация «{name}»…"));
                         let converted = conv.convert(&e.path, "xlsx", &tmp.path().join(format!("in{i}")))?;
                         // LibreOffice может изменить имена листов (обрезает до 31 символа), поэтому выбираем по номеру.
                         let after = excel::list_sheets(&converted)?;
-                        let names = e
-                            .selected
-                            .iter()
-                            .map(|&k| after.get(k).map(|s| s.name.clone()).ok_or_else(|| anyhow!("в «{name}» не найден лист №{}", k + 1)))
-                            .collect::<Result<Vec<_>>>()?;
-                        (converted, names)
+                        let names = converted_names(&e.selected, &after, &name)?;
+                        (relabel(&converted, &e.path, tmp.path(), i)?, names)
                     }
                 };
                 sources.push(excel::Source { path, sheets: names });
@@ -190,10 +229,11 @@ pub fn run(job: &Job, cancel: &AtomicBool, progress: &dyn Fn(&str)) -> Result<Ou
                 let name = e.path.file_name().unwrap_or_default().to_string_lossy().into_owned();
                 match sniff(&e.path)? {
                     Sniffed::Docx => docs.push(e.path.clone()),
-                    Sniffed::Xlsx | Sniffed::Unknown => bail!("«{name}» не является документом Word"),
-                    Sniffed::Ole | Sniffed::OtherZip => {
+                    Sniffed::Xlsx | Sniffed::Unknown => bail!("«{name}» не является документом Word (файл повреждён или другого формата)"),
+                    Sniffed::Ole | Sniffed::OtherZip | Sniffed::Text => {
                         progress(&format!("Конвертация «{name}»…"));
-                        docs.push(conv.convert(&e.path, "docx", &tmp.path().join(format!("in{i}")))?);
+                        let converted = conv.convert(&e.path, "docx", &tmp.path().join(format!("in{i}")))?;
+                        docs.push(relabel(&converted, &e.path, tmp.path(), i)?);
                     }
                 }
             }
@@ -208,20 +248,50 @@ pub fn run(job: &Job, cancel: &AtomicBool, progress: &dyn Fn(&str)) -> Result<Ou
         Target::Pdf => {
             check_cancel(cancel)?;
             progress("Создание PDF…");
-            conv.convert(&merged, "pdf", &tmp.path().join("pdf"))?
+            // В PDF нет таблиц и имён Excel — предупреждения об их переименовании ни к чему.
+            warnings.retain(|w| {
+                !(w.contains("таблица «") && w.contains("переименована")) && !(w.contains("имя «") && w.contains("переименовано"))
+            });
+            conv.convert_result(&merged, "pdf", &tmp.path().join("pdf"))?
         }
     };
     check_cancel(cancel)?;
-    // Результат кладётся в итоговый файл только целиком — исходный файл не портится при сбое.
-    std::fs::copy(&result, &job.out).map_err(|e| {
-        anyhow!("Не удалось сохранить «{}»: {e}. Возможно, файл открыт в другой программе или нет прав на запись.", job.out.display())
-    })?;
+    save_atomically(&result, &job.out)?;
     Ok(Outcome { warnings })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn converted_sheet_names_follow_indexes() {
+        let after: Vec<excel::SheetInfo> =
+            ["A", "B (обрезано)", "C"].iter().map(|n| excel::SheetInfo { name: n.to_string(), hidden: false }).collect();
+        assert_eq!(converted_names(&[2, 0], &after, "f.xls").unwrap(), ["C", "A"]);
+        assert!(converted_names(&[3], &after, "f.xls").unwrap_err().to_string().contains("№4"));
+    }
+
+    #[test]
+    fn sniffs_text_formats() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, body, want) in [("a.xls", "\u{feff} <HTML><body>", Sniffed::Text), ("b.doc", "{\\rtf1\\ansi", Sniffed::Text), ("c.xls", "a,b", Sniffed::Unknown)] {
+            let p = dir.path().join(name);
+            std::fs::write(&p, body).unwrap();
+            assert_eq!(sniff(&p).unwrap(), want, "{name}");
+        }
+    }
+
+    #[test]
+    fn atomic_save_replaces_and_cleans_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let (src, out) = (dir.path().join("s.bin"), dir.path().join("o.bin"));
+        std::fs::write(&src, b"new").unwrap();
+        std::fs::write(&out, b"old").unwrap();
+        save_atomically(&src, &out).unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), b"new");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
 
     fn entry(p: &Path) -> JobEntry {
         JobEntry { path: p.to_path_buf(), all_sheets: vec![], selected: vec![] }

@@ -7,7 +7,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::OnceLock;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -26,6 +26,12 @@ struct Output {
 /// Запускает команду, опрашивая флаг отмены и таймаут; при отмене убивает всё дерево процессов.
 fn run_cmd(cmd: &mut Command, cancel: &AtomicBool, timeout: Duration) -> Result<Output> {
     hide_window(cmd);
+    #[cfg(unix)]
+    {
+        // Отдельная группа процессов: при отмене убиваем и дочерний soffice.bin.
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
     let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -54,16 +60,26 @@ fn run_cmd(cmd: &mut Command, cancel: &AtomicBool, timeout: Duration) -> Result<
         }
         std::thread::sleep(Duration::from_millis(80));
     };
+    let Some(st) = status else {
+        // Потоки чтения не ждём: их трубы может держать оставшийся дочерний процесс.
+        return if cancel.load(Ordering::Relaxed) {
+            Err(anyhow!(CANCELLED))
+        } else {
+            Err(anyhow!("Конвертер не ответил за {} мин. и был остановлен", timeout.as_secs() / 60))
+        };
+    };
     let stdout = out_t.join().unwrap_or_default();
     let stderr = err_t.join().unwrap_or_default();
-    match status {
-        Some(st) => Ok(Output { ok: st.success(), stdout, stderr }),
-        None if cancel.load(Ordering::Relaxed) => bail!("Операция отменена"),
-        None => bail!("Конвертер не ответил за {} мин. и был остановлен", timeout.as_secs() / 60),
-    }
+    Ok(Output { ok: st.success(), stdout, stderr })
 }
 
+/// Текст ошибки отмены (по нему интерфейс отличает отмену от сбоя).
+pub const CANCELLED: &str = "Операция отменена";
+
 fn kill_tree(child: &mut std::process::Child) {
+    if cfg!(unix) {
+        let _ = Command::new("kill").args(["-KILL", &format!("-{}", child.id())]).output();
+    }
     if cfg!(windows) {
         // soffice.exe запускает дочерний soffice.bin — убиваем всё дерево.
         let mut k = Command::new("taskkill");
@@ -76,10 +92,21 @@ fn kill_tree(child: &mut std::process::Child) {
 
 // ───────────────────────── поиск LibreOffice ─────────────────────────
 
-static SOFFICE: OnceLock<Option<PathBuf>> = OnceLock::new();
+/// Найденный LibreOffice кэшируется; «не найден» помним лишь несколько секунд — пользователь мог его установить.
+static SOFFICE: Mutex<(Option<PathBuf>, Option<Instant>)> = Mutex::new((None, None));
+const NEGATIVE_TTL: Duration = Duration::from_secs(5);
 
 fn find_soffice() -> Option<PathBuf> {
-    SOFFICE.get_or_init(discover_soffice).clone()
+    let mut g = SOFFICE.lock().unwrap_or_else(|e| e.into_inner());
+    if g.0.is_some() {
+        return g.0.clone();
+    }
+    if g.1.is_some_and(|t| t.elapsed() < NEGATIVE_TTL) {
+        return None;
+    }
+    g.0 = discover_soffice();
+    g.1 = Some(Instant::now());
+    g.0.clone()
 }
 
 fn discover_soffice() -> Option<PathBuf> {
@@ -136,7 +163,7 @@ fn reg_default_value(key: &str) -> Option<String> {
     if !out.status.success() {
         return None;
     }
-    let text = String::from_utf8_lossy(&out.stdout);
+    let text = crate::shell::decode_console(&out.stdout);
     let line = text.lines().find(|l| l.contains("REG_SZ"))?;
     Some(line.split("REG_SZ").nth(1)?.trim().to_string())
 }
@@ -147,8 +174,19 @@ fn office_installed() -> bool {
 
 /// Есть ли чем конвертировать (LibreOffice или, в Windows, Microsoft Office).
 pub fn available() -> bool {
-    static AVAILABLE: OnceLock<bool> = OnceLock::new();
-    *AVAILABLE.get_or_init(|| find_soffice().is_some() || office_installed())
+    static OFFICE: Mutex<Option<(bool, Instant)>> = Mutex::new(None);
+    if find_soffice().is_some() {
+        return true;
+    }
+    let mut g = OFFICE.lock().unwrap_or_else(|e| e.into_inner());
+    match *g {
+        Some((v, t)) if v || t.elapsed() < NEGATIVE_TTL => v,
+        _ => {
+            let v = office_installed();
+            *g = Some((v, Instant::now()));
+            v
+        }
+    }
 }
 
 pub const MISSING_HINT: &str =
@@ -169,12 +207,25 @@ impl<'a> Converter<'a> {
 
     /// Конвертирует `input` в формат `fmt` ("pdf", "docx", "xlsx"), результат кладёт в `out_dir`.
     pub fn convert(&self, input: &Path, fmt: &str, out_dir: &Path) -> Result<PathBuf> {
+        self.convert_inner(input, fmt, out_dir, false)
+    }
+
+    /// Последний шаг: объединённый файл → PDF (ошибка не должна обвинять исходные файлы).
+    pub fn convert_result(&self, merged: &Path, fmt: &str, out_dir: &Path) -> Result<PathBuf> {
+        self.convert_inner(merged, fmt, out_dir, true)
+    }
+
+    fn convert_inner(&self, input: &Path, fmt: &str, out_dir: &Path, is_result: bool) -> Result<PathBuf> {
         std::fs::create_dir_all(out_dir)?;
         let stem = input.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
         let expected = out_dir.join(format!("{stem}.{fmt}"));
         let name = input.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
         let unreadable = || {
-            anyhow!("Не удалось преобразовать «{name}»: файл повреждён, защищён паролем или имеет другой формат, чем указано в расширении")
+            if is_result {
+                anyhow!("Не удалось создать {} из объединённого файла: конвертер завершился с ошибкой", fmt.to_uppercase())
+            } else {
+                anyhow!("Не удалось преобразовать «{name}»: файл повреждён, защищён паролем или имеет другой формат, чем указано в расширении")
+            }
         };
 
         let Some(soffice) = find_soffice() else {
@@ -284,7 +335,11 @@ mod tests {
     fn cancel_kills_process() {
         let cancel = AtomicBool::new(true);
         let mut cmd = Command::new(if cfg!(windows) { "ping" } else { "sleep" });
-        cmd.arg(if cfg!(windows) { "-n 30 127.0.0.1" } else { "30" });
+        if cfg!(windows) {
+            cmd.args(["-n", "30", "127.0.0.1"]);
+        } else {
+            cmd.arg("30");
+        }
         let t = Instant::now();
         assert!(run_cmd(&mut cmd, &cancel, Duration::from_secs(60)).is_err());
         assert!(t.elapsed() < Duration::from_secs(5));

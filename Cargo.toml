@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 description = "Объединяет листы Excel или документы Word в один файл или PDF"
 license = "MIT"
-rust-version = "1.85"
+rust-version = "1.95"
 publish = false
 
 [dependencies]

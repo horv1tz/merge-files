@@ -30,7 +30,10 @@ pub enum Role {
 
 /// Определяет роль экземпляра; при запуске с файлами ждёт первого экземпляра до ~1.5 с.
 pub fn claim(paths: &[PathBuf]) -> Role {
-    let addr: SocketAddr = ADDR.parse().unwrap();
+    claim_at(ADDR.parse().unwrap(), paths)
+}
+
+fn claim_at(addr: SocketAddr, paths: &[PathBuf]) -> Role {
     for _ in 0..30 {
         if let Ok(l) = TcpListener::bind(addr) {
             return Role::Primary(l);
@@ -59,8 +62,9 @@ enum Forward {
 
 fn forward(addr: &SocketAddr, paths: &[PathBuf]) -> Forward {
     let Ok(mut s) = TcpStream::connect_timeout(addr, Duration::from_millis(300)) else { return Forward::Refused };
-    let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
-    let _ = s.set_write_timeout(Some(Duration::from_secs(2)));
+    // Первый экземпляр может быть занят запуском окна — ждём ответ подольше.
+    let _ = s.set_read_timeout(Some(Duration::from_secs(10)));
+    let _ = s.set_write_timeout(Some(Duration::from_secs(5)));
     let mut text = format!("{MAGIC}\n");
     for p in paths {
         text.push_str(&p.to_string_lossy());
@@ -133,25 +137,67 @@ fn command_line(exe: &Path) -> String {
     format!("\"{}\" \"%1\"", exe.display())
 }
 
+/// Короткий ASCII-идентификатор exe (FNV-1a): путь с кириллицей нельзя надёжно прочитать из вывода reg.exe.
+fn exe_id(exe: &Path) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in exe.to_string_lossy().to_lowercase().bytes() {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("{h:016x}")
+}
+
+/// Декодирует вывод консольной программы (в Windows — в кодировке OEM, например cp866).
+pub fn decode_console(bytes: &[u8]) -> String {
+    #[cfg(windows)]
+    {
+        unsafe extern "system" {
+            fn MultiByteToWideChar(cp: u32, flags: u32, src: *const u8, n: i32, dst: *mut u16, cap: i32) -> i32;
+        }
+        if bytes.is_empty() || bytes.len() > i32::MAX as usize {
+            return String::new();
+        }
+        let n = bytes.len() as i32;
+        // SAFETY: буфер достаточного размера (число UTF-16 единиц не больше числа байт); CP_OEMCP = 1.
+        unsafe {
+            let mut buf = vec![0u16; bytes.len()];
+            let len = MultiByteToWideChar(1, 0, bytes.as_ptr(), n, buf.as_mut_ptr(), n);
+            if len > 0 {
+                buf.truncate(len as usize);
+                return String::from_utf16_lossy(&buf);
+            }
+        }
+    }
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
 pub fn menu_state() -> MenuState {
     if !cfg!(windows) {
         return MenuState::NotInstalled;
     }
-    let mut state = MenuState::NotInstalled;
-    let Ok(exe) = std::env::current_exe() else { return state };
-    let want = command_line(&exe).to_lowercase();
+    let Ok(exe) = std::env::current_exe() else { return MenuState::NotInstalled };
+    let want = exe_id(&exe);
+    let (mut ok, mut any) = (0, false);
     for ext in EXTS {
-        let Ok(out) = reg(&["query", &format!(r"{}\command", key_for(ext)), "/ve"]) else { continue };
-        if !out.status.success() {
-            continue;
+        let key = key_for(ext);
+        let Ok(out) = reg(&["query", &key, "/v", "ExeId"]) else { continue };
+        if out.status.success() {
+            any = true;
+            // Значение — ASCII, кодировка вывода не важна.
+            if String::from_utf8_lossy(&out.stdout).split_whitespace().any(|w| w == want) {
+                ok += 1;
+            }
+        } else if reg(&["query", &key]).is_ok_and(|o| o.status.success()) {
+            any = true;
         }
-        let text = String::from_utf8_lossy(&out.stdout).to_lowercase();
-        if text.contains(&want) {
-            return MenuState::Installed;
-        }
-        state = MenuState::Stale;
     }
-    state
+    if ok == EXTS.len() {
+        MenuState::Installed
+    } else if any {
+        MenuState::Stale
+    } else {
+        MenuState::NotInstalled
+    }
 }
 
 /// Добавляет пункт «Объединить файлы…» в меню файлов Excel/Word (для текущего пользователя).
@@ -167,6 +213,7 @@ pub fn install_menu() -> Result<()> {
         let cmd_key = format!(r"{key}\command");
         let ok = reg(&["add", &key, "/ve", "/d", MENU_LABEL, "/f"])?.status.success()
             && reg(&["add", &key, "/v", "Icon", "/d", &icon, "/f"])?.status.success()
+            && reg(&["add", &key, "/v", "ExeId", "/d", &exe_id(&exe), "/f"])?.status.success()
             && reg(&["add", &cmd_key, "/ve", "/d", &command, "/f"])?.status.success();
         if !ok {
             bail!("не удалось записать пункт меню в реестр (.{ext})");
@@ -201,14 +248,14 @@ pub fn natural_key(name: &str) -> String {
             digits.push(c);
         } else {
             if !digits.is_empty() {
-                out.push_str(&format!("{digits:0>12}"));
+                out.push_str(&format!("{digits:0>20}"));
                 digits.clear();
             }
             out.push(c);
         }
     }
     if !digits.is_empty() {
-        out.push_str(&format!("{digits:0>12}"));
+        out.push_str(&format!("{digits:0>20}"));
     }
     out
 }
@@ -219,11 +266,13 @@ mod tests {
 
     #[test]
     fn second_instance_forwards_paths_with_ack() {
-        let Role::Primary(l) = claim(&[]) else { panic!("порт должен быть свободен") };
+        // Свободный порт, чтобы тест не зависел от запущенной программы.
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
         serve(l, move |b| tx.send(b).unwrap());
         let paths = vec![PathBuf::from("/tmp/a b.docx"), PathBuf::from("/tmp/c.docx")];
-        assert!(matches!(claim(&paths), Role::Forwarded));
+        assert!(matches!(claim_at(addr, &paths), Role::Forwarded));
         assert_eq!(rx.recv_timeout(Duration::from_secs(3)).unwrap(), paths);
     }
 
@@ -232,5 +281,14 @@ mod tests {
         let mut v = vec!["file10.docx", "File2.docx", "file1.docx"];
         v.sort_by_key(|s| natural_key(s));
         assert_eq!(v, ["file1.docx", "File2.docx", "file10.docx"]);
+        assert!(natural_key("a9999999999999.x") < natural_key("a10000000000000.x"));
+    }
+
+    #[test]
+    fn exe_id_is_stable_ascii() {
+        let id = exe_id(Path::new(r"C:\Users\Иван\Merge Files.exe"));
+        assert_eq!(id.len(), 16);
+        assert!(id.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert_eq!(id, exe_id(Path::new(r"c:\users\иван\merge files.exe")));
     }
 }
