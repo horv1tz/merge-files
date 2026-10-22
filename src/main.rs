@@ -51,11 +51,12 @@ struct App {
     rx: Option<Receiver<Result<PathBuf, String>>>,
     incoming: Option<Receiver<Vec<PathBuf>>>,
     menu_installed: bool,
+    show_settings: bool,
 }
 
 impl App {
     fn new() -> Self {
-        App { entries: vec![], kind: None, target: Target::Same, status: String::new(), is_error: false, rx: None, incoming: None, menu_installed: shell::menu_installed() }
+        App { entries: vec![], kind: None, target: Target::Same, status: String::new(), is_error: false, rx: None, incoming: None, menu_installed: shell::menu_installed(), show_settings: false }
     }
 
     fn error(&mut self, msg: String) {
@@ -179,6 +180,38 @@ fn run(kind: Kind, target: Target, entries: Vec<(PathBuf, Vec<String>)>, out: &P
     Ok(())
 }
 
+impl App {
+    fn settings_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.show_settings;
+        egui::Window::new("Настройки").open(&mut open).collapsible(false).resizable(false).show(ctx, |ui| {
+            ui.strong("Интеграция с проводником");
+            let mut on = self.menu_installed;
+            let resp = ui.add_enabled(
+                shell::menu_supported(),
+                egui::Checkbox::new(&mut on, "Пункт «Объединить файлы…» в контекстном меню"),
+            );
+            if resp.changed() {
+                let r = if on { shell::install_menu() } else { shell::uninstall_menu() };
+                self.menu_installed = shell::menu_installed();
+                match r {
+                    Ok(()) => {
+                        self.status = if on { "Пункт добавлен в контекстное меню" } else { "Пункт удалён из контекстного меню" }.into();
+                        self.is_error = false;
+                    }
+                    Err(e) => self.error(format!("{e:#}")),
+                }
+            }
+            if shell::menu_supported() {
+                ui.weak("Файлы Excel и Word → ПКМ → «Объединить файлы…». Права администратора не нужны.");
+                ui.weak("Windows 11: пункт в «Показать дополнительные параметры». Если переместите exe — включите заново.");
+            } else {
+                ui.weak("Доступно только в Windows.");
+            }
+        });
+        self.show_settings = open;
+    }
+}
+
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
@@ -244,6 +277,12 @@ impl eframe::App for App {
                     self.kind = None;
                 }
                 ui.label("или перетащите файлы в окно");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("⚙ Настройки").clicked() {
+                        self.show_settings = true;
+                        self.menu_installed = shell::menu_installed();
+                    }
+                });
             });
             ui.separator();
 
@@ -293,6 +332,8 @@ impl eframe::App for App {
             }
         });
 
+        self.settings_window(&ctx);
+
         egui::Panel::bottom("controls").show(ui, |ui| {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
@@ -311,27 +352,6 @@ impl eframe::App for App {
             });
             if ui.add_enabled(ready && !busy, egui::Button::new("Объединить…").min_size([160.0, 32.0].into())).clicked() {
                 self.merge(&ctx);
-            }
-            if shell::menu_supported() {
-                ui.horizontal(|ui| {
-                    if self.menu_installed {
-                        if ui.small_button("Убрать из контекстного меню").clicked() {
-                            match shell::uninstall_menu() {
-                                Ok(()) => self.menu_installed = shell::menu_installed(),
-                                Err(e) => self.error(format!("{e:#}")),
-                            }
-                        }
-                    } else if ui.small_button("Добавить в контекстное меню проводника").clicked() {
-                        match shell::install_menu() {
-                            Ok(()) => {
-                                self.menu_installed = shell::menu_installed();
-                                self.status = "Пункт «Объединить файлы…» добавлен в меню файлов".into();
-                                self.is_error = false;
-                            }
-                            Err(e) => self.error(format!("{e:#}")),
-                        }
-                    }
-                });
             }
             if self.target == Target::Pdf || self.entries.iter().any(|e| e.path.extension().is_some_and(|x| x == "doc")) {
                 ui.weak("PDF, .doc, .xls и .ods требуют LibreOffice (в Windows подойдёт и Microsoft Office).");
