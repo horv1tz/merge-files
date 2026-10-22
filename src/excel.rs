@@ -1,11 +1,10 @@
 //! Объединение листов Excel в одну книгу.
 //!
-//! Читаются значения ячеек (формулы заменяются вычисленными значениями,
-//! стили и объединённые ячейки не переносятся), ширина столбцов подбирается автоматически.
+//! Листы копируются вместе с форматированием (стили, объединённые ячейки,
+//! ширина столбцов, формулы). Нужен .xlsx; прочие форматы конвертируются заранее.
 
 use anyhow::{Context, Result, anyhow};
-use calamine::{Data, Reader, open_workbook_auto};
-use rust_xlsxwriter::{Format, Workbook};
+use calamine::{Reader, open_workbook_auto};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
@@ -22,58 +21,54 @@ pub struct Source {
 }
 
 pub fn merge(sources: &[Source], out: &Path) -> Result<()> {
-    let mut book = Workbook::new();
+    let mut base: Option<umya_spreadsheet::Workbook> = None;
     let mut used: HashSet<String> = HashSet::new();
-    let date = Format::new().set_num_format("yyyy-mm-dd");
-    let datetime = Format::new().set_num_format("yyyy-mm-dd hh:mm:ss");
-    let mut count = 0;
 
     for src in sources {
-        let mut wb = open_workbook_auto(&src.path)
-            .with_context(|| format!("не удалось открыть {}", src.path.display()))?;
+        let mut wb = umya_spreadsheet::reader::xlsx::read(&src.path)
+            .map_err(|e| anyhow!("не удалось прочитать {}: {e:?}", src.path.display()))?;
         let stem = src.path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-        for sheet in &src.sheets {
-            let range = wb
-                .worksheet_range(sheet)
-                .with_context(|| format!("лист «{sheet}» в {}", src.path.display()))?;
-            let name = unique_name(&mut used, sheet, &stem);
-            let ws = book.add_worksheet();
-            ws.set_name(&name)?;
-            let (r0, c0) = range.start().unwrap_or((0, 0));
-            for (r, c, cell) in range.cells() {
-                let (row, col) = (r as u32 + r0, c as u16 + c0 as u16);
-                match cell {
-                    Data::Empty => {}
-                    Data::String(s) | Data::DateTimeIso(s) | Data::DurationIso(s) => {
-                        ws.write_string(row, col, s)?;
-                    }
-                    Data::Int(i) => {
-                        ws.write_number(row, col, *i as f64)?;
-                    }
-                    Data::Float(f) => {
-                        ws.write_number(row, col, *f)?;
-                    }
-                    Data::Bool(b) => {
-                        ws.write_boolean(row, col, *b)?;
-                    }
-                    Data::DateTime(d) => {
-                        let v = d.as_f64();
-                        let fmt = if v.fract() == 0.0 { &date } else { &datetime };
-                        ws.write_number_with_format(row, col, v, fmt)?;
-                    }
-                    Data::Error(e) => {
-                        ws.write_string(row, col, e.to_string())?;
-                    }
+        let all: Vec<String> = wb.sheet_collection().iter().map(|s| s.name().to_string()).collect();
+        for name in &src.sheets {
+            if !all.contains(name) {
+                return Err(anyhow!("в {} нет листа «{name}»", src.path.display()));
+            }
+        }
+        match base.as_mut() {
+            None => {
+                // Первая книга — основа: сохраняются её тема и стили.
+                for name in all.iter().filter(|n| !src.sheets.contains(n)) {
+                    wb.remove_sheet_by_name(name).map_err(|e| anyhow!("{e:?}"))?;
+                }
+                for name in &src.sheets {
+                    let new = unique_name(&mut used, name, &stem);
+                    let ws = wb.sheet_by_name_mut(name).map_err(|e| anyhow!("{e:?}"))?;
+                    ws.set_name(new);
+                }
+                base = Some(wb);
+            }
+            Some(book) => {
+                for name in &src.sheets {
+                    let mut ws = wb.sheet_by_name(name).map_err(|e| anyhow!("{e:?}"))?.clone();
+                    ws.set_name(unique_name(&mut used, name, &stem));
+                    book.add_sheet(ws).map_err(|e| anyhow!("{e:?}"))?;
                 }
             }
-            ws.autofit();
-            count += 1;
         }
     }
-    if count == 0 {
+    let mut book = base.ok_or_else(|| anyhow!("не выбрано ни одного листа"))?;
+    if book.sheet_collection().is_empty() {
         return Err(anyhow!("не выбрано ни одного листа"));
     }
-    book.save(out).with_context(|| format!("не удалось сохранить {}", out.display()))?;
+    // Выделенными должны быть не все листы сразу (иначе Excel откроет групповой режим).
+    for (i, ws) in book.sheet_collection_mut().iter_mut().enumerate() {
+        for view in ws.sheet_views_mut().sheet_view_list_mut() {
+            view.set_tab_selected(i == 0);
+        }
+    }
+    book.set_active_sheet(0);
+    umya_spreadsheet::writer::xlsx::write(&book, out)
+        .map_err(|e| anyhow!("не удалось сохранить {}: {e:?}", out.display()))?;
     Ok(())
 }
 
@@ -99,4 +94,43 @@ fn unique_name(used: &mut HashSet<String>, sheet: &str, file_stem: &str) -> Stri
         }
     }
     unreachable!()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make(path: &Path, cell: &str) {
+        let mut b = umya_spreadsheet::new_file();
+        {
+            let ws = b.sheet_by_name_mut("Sheet1").unwrap();
+            ws.cell_mut("A1").set_value(cell);
+            ws.cell_mut("A1").style_mut().font_mut().set_bold(true);
+        }
+        umya_spreadsheet::writer::xlsx::write(&b, path).unwrap();
+    }
+
+    #[test]
+    fn merges_sheets_with_unique_names_and_styles() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b, out) = (dir.path().join("a.xlsx"), dir.path().join("b.xlsx"), dir.path().join("o.xlsx"));
+        make(&a, "first");
+        make(&b, "second");
+        let src = |p: &PathBuf| Source { path: p.clone(), sheets: vec!["Sheet1".into()] };
+        merge(&[src(&a), src(&b)], &out).unwrap();
+        let book = umya_spreadsheet::reader::xlsx::read(&out).unwrap();
+        let names: Vec<_> = book.sheet_collection().iter().map(|s| s.name().to_string()).collect();
+        assert_eq!(names, ["Sheet1", "b_Sheet1"]);
+        let ws = book.sheet_by_name("b_Sheet1").unwrap();
+        assert_eq!(ws.cell("A1").unwrap().value(), "second");
+        assert_eq!(ws.cell("A1").unwrap().style().font().unwrap().bold(), true);
+    }
+
+    #[test]
+    fn sheet_names_are_valid() {
+        let mut used = HashSet::new();
+        assert_eq!(unique_name(&mut used, "a/b", "f"), "ab");
+        assert_eq!(unique_name(&mut used, "AB", "f"), "f_AB");
+        assert_eq!(unique_name(&mut used, "AB", "f"), "AB_2");
+    }
 }

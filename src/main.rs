@@ -1,3 +1,5 @@
+#![cfg_attr(all(not(debug_assertions), windows), windows_subsystem = "windows")]
+
 mod excel;
 mod pdf;
 mod word;
@@ -128,18 +130,30 @@ fn run(kind: Kind, target: Target, entries: Vec<(PathBuf, Vec<String>)>, out: &P
     };
     match kind {
         Kind::Excel => {
-            let sources: Vec<_> = entries
-                .into_iter()
-                .filter(|(_, s)| !s.is_empty())
-                .map(|(path, sheets)| excel::Source { path, sheets })
-                .collect();
+            let mut sources = vec![];
+            for (path, sheets) in entries.into_iter().filter(|(_, s)| !s.is_empty()) {
+                // Форматы кроме xlsx/xlsm (xls, ods) сначала конвертируются в xlsx.
+                let native = path
+                    .extension()
+                    .is_some_and(|e| e.eq_ignore_ascii_case("xlsx") || e.eq_ignore_ascii_case("xlsm"));
+                let path = if native {
+                    path
+                } else {
+                    let dir = tmp.path().join(format!("in{}", sources.len()));
+                    std::fs::create_dir_all(&dir)?;
+                    pdf::convert(&path, "xlsx", &dir)?
+                };
+                sources.push(excel::Source { path, sheets });
+            }
             excel::merge(&sources, &merged)?;
         }
         Kind::Word => {
             let mut docs = vec![];
-            for (path, _) in entries {
+            for (i, (path, _)) in entries.into_iter().enumerate() {
                 if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("doc")) {
-                    docs.push(pdf::convert(&path, "docx", tmp.path())?);
+                    let dir = tmp.path().join(format!("in{i}"));
+                    std::fs::create_dir_all(&dir)?;
+                    docs.push(pdf::convert(&path, "docx", &dir)?);
                 } else {
                     docs.push(path);
                 }
@@ -148,7 +162,9 @@ fn run(kind: Kind, target: Target, entries: Vec<(PathBuf, Vec<String>)>, out: &P
         }
     }
     if target == Target::Pdf {
-        let result = pdf::convert(&merged, "pdf", tmp.path())?;
+        let dir = tmp.path().join("pdf");
+        std::fs::create_dir_all(&dir)?;
+        let result = pdf::convert(&merged, "pdf", &dir)?;
         std::fs::copy(result, out)?;
     }
     Ok(())
@@ -276,7 +292,7 @@ impl eframe::App for App {
                 self.merge(&ctx);
             }
             if self.target == Target::Pdf || self.entries.iter().any(|e| e.path.extension().is_some_and(|x| x == "doc")) {
-                ui.weak("PDF и .doc требуют установленный LibreOffice.");
+                ui.weak("PDF, .doc, .xls и .ods требуют LibreOffice (в Windows подойдёт и Microsoft Office).");
             }
         });
     }

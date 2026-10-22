@@ -118,7 +118,8 @@ fn append(base: &mut Docx, other: &Docx, n: usize) -> Result<()> {
     // Картинки и гиперссылки: переносим связи с новыми идентификаторами.
     let mut new_rels = String::new();
     for (k, tag) in other_rels.split("<Relationship ").skip(1).enumerate() {
-        let tag = tag.split("/>").next().unwrap_or("");
+        let tag = format!(" {}", tag.split("/>").next().unwrap_or(""));
+        let tag = tag.as_str();
         let (Some(id), Some(ty), Some(target)) = (attr(tag, "Id"), attr(tag, "Type"), attr(tag, "Target")) else {
             continue;
         };
@@ -153,23 +154,13 @@ fn append(base: &mut Docx, other: &Docx, n: usize) -> Result<()> {
     let pos = base_rels.rfind("</Relationships>").ok_or_else(|| anyhow!("повреждён {RELS}"))?;
     base_rels.insert_str(pos, &new_rels);
 
-    // Пространства имён корневого элемента другого документа, которых нет в базе.
-    let other_root = root_tag(&other_doc)?;
-    let mut decls = String::new();
-    for part in other_root.split_whitespace() {
-        if let Some(rest) = part.strip_prefix("xmlns:") {
-            let prefix = rest.split('=').next().unwrap_or("");
-            if !root_tag(&base_doc)?.contains(&format!("xmlns:{prefix}=")) {
-                decls.push(' ');
-                decls.push_str(part.trim_end_matches('>'));
-            }
-        }
-    }
-    if !decls.is_empty() {
-        let r = root_tag(&base_doc)?.len();
-        let at = base_doc.find("<w:document").unwrap() + r - 1;
-        base_doc.insert_str(at, &decls);
-    }
+    merge_namespaces(&mut base_doc, &other_doc, "<w:document")?;
+
+    // Стили и нумерация другого документа, которых нет в базе.
+    let shift = n as u64 * 1000;
+    merge_styles(base, other, shift)?;
+    merge_numbering(base, other, shift, &mut base_rels, &mut base_types)?;
+    content = shift_ids(&content, shift, false);
 
     let (_, be) = body_bounds(&base_doc)?;
     base_doc.insert_str(be, &format!("{PAGE_BREAK}{content}"));
@@ -180,9 +171,29 @@ fn append(base: &mut Docx, other: &Docx, n: usize) -> Result<()> {
     Ok(())
 }
 
-/// Открывающий тег `<w:document ...>` целиком.
-fn root_tag(doc: &str) -> Result<&str> {
-    let s = doc.find("<w:document").ok_or_else(|| anyhow!("нет <w:document>"))?;
+/// Добавляет в корневой элемент `base` объявления xmlns, которые есть в `other`, но нет в `base`.
+fn merge_namespaces(base: &mut String, other: &str, root: &str) -> Result<()> {
+    let other_root = root_tag(other, root)?;
+    let mut decls = String::new();
+    for part in other_root.split_whitespace() {
+        if let Some(rest) = part.strip_prefix("xmlns:") {
+            let prefix = rest.split('=').next().unwrap_or("");
+            if !root_tag(base, root)?.contains(&format!("xmlns:{prefix}=")) {
+                decls.push(' ');
+                decls.push_str(part.trim_end_matches('>').trim_end_matches('/'));
+            }
+        }
+    }
+    if !decls.is_empty() {
+        let at = base.find(root).unwrap() + root_tag(base, root)?.len() - 1;
+        base.insert_str(at, &decls);
+    }
+    Ok(())
+}
+
+/// Открывающий тег корневого элемента (например `<w:document ...>`) целиком.
+fn root_tag<'a>(doc: &'a str, root: &str) -> Result<&'a str> {
+    let s = doc.find(root).ok_or_else(|| anyhow!("нет {root}"))?;
     let e = doc[s..].find('>').ok_or_else(|| anyhow!("повреждён document.xml"))?;
     Ok(&doc[s..=s + e])
 }
@@ -199,5 +210,162 @@ fn ensure_default_type(base_types: &mut String, other_types: &str, ext: &str) {
         .find(|t| attr(&format!(" {t}"), "Extension").is_some_and(|e| e.eq_ignore_ascii_case(ext)));
     if let (Some(t), Some(pos)) = (found, base_types.rfind("</Types>")) {
         base_types.insert_str(pos, &format!("<Default {t}/>"));
+    }
+}
+
+/// Увеличивает числовые идентификаторы нумерации (`numId`, при `abstract_too` и `abstractNumId`).
+/// Нулевой `numId` («без списка») не меняется.
+fn shift_ids(s: &str, offset: u64, abstract_too: bool) -> String {
+    let mut pats = vec!["w:numId=\"", "<w:numId w:val=\""];
+    if abstract_too {
+        pats.extend(["w:abstractNumId=\"", "<w:abstractNumId w:val=\""]);
+    }
+    let mut out = s.to_string();
+    for pat in pats {
+        let mut res = String::with_capacity(out.len());
+        let mut rest = out.as_str();
+        while let Some(i) = rest.find(pat) {
+            let after = i + pat.len();
+            res.push_str(&rest[..after]);
+            rest = &rest[after..];
+            let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+            match rest[..digits].parse::<u64>() {
+                Ok(v) if v != 0 || pat.contains("abstract") => res.push_str(&(v + offset).to_string()),
+                _ => res.push_str(&rest[..digits]),
+            }
+            rest = &rest[digits..];
+        }
+        res.push_str(rest);
+        out = res;
+    }
+    out
+}
+
+/// Вырезает блоки `<open ...>...</close>` (для абзацев нумерации и стилей).
+fn blocks<'a>(xml: &'a str, open: &str, close: &str) -> Vec<&'a str> {
+    let mut v = vec![];
+    let mut rest = xml;
+    while let Some(i) = rest.find(open) {
+        let Some(j) = rest[i..].find(close) else { break };
+        let end = i + j + close.len();
+        v.push(&rest[i..end]);
+        rest = &rest[end..];
+    }
+    v
+}
+
+fn merge_styles(base: &mut Docx, other: &Docx, shift: u64) -> Result<()> {
+    let (Some(_), Some(_)) = (base.get("word/styles.xml"), other.get("word/styles.xml")) else {
+        return Ok(());
+    };
+    let mut b = base.text("word/styles.xml")?;
+    let o = other.text("word/styles.xml")?;
+    let mut add = String::new();
+    for st in blocks(&o, "<w:style ", "</w:style>") {
+        let Some(id) = attr(st, "w:styleId") else { continue };
+        if !b.contains(&format!("w:styleId=\"{id}\"")) {
+            add.push_str(&shift_ids(st, shift, false));
+        }
+    }
+    if !add.is_empty() {
+        merge_namespaces(&mut b, &o, "<w:styles")?;
+        let pos = b.rfind("</w:styles>").ok_or_else(|| anyhow!("повреждён styles.xml"))?;
+        b.insert_str(pos, &add);
+        base.set("word/styles.xml", b.into_bytes());
+    }
+    Ok(())
+}
+
+fn merge_numbering(base: &mut Docx, other: &Docx, shift: u64, rels: &mut String, types: &mut String) -> Result<()> {
+    let Some(o) = other.get("word/numbering.xml") else { return Ok(()) };
+    let o = String::from_utf8_lossy(o).into_owned();
+    let abstracts: String = blocks(&o, "<w:abstractNum ", "</w:abstractNum>").concat();
+    let nums: String = blocks(&o, "<w:num ", "</w:num>").concat();
+    if abstracts.is_empty() && nums.is_empty() {
+        return Ok(());
+    }
+    let mut b = match base.get("word/numbering.xml") {
+        Some(d) => String::from_utf8_lossy(d).into_owned(),
+        None => {
+            // В базе нет нумерации: создаём часть и связи с ней.
+            let at = rels.rfind("</Relationships>").ok_or_else(|| anyhow!("повреждён {RELS}"))?;
+            rels.insert_str(
+                at,
+                r#"<Relationship Id="rIdMnum" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/numbering" Target="numbering.xml"/>"#,
+            );
+            let at = types.rfind("</Types>").ok_or_else(|| anyhow!("повреждён {TYPES}"))?;
+            types.insert_str(
+                at,
+                r#"<Override PartName="/word/numbering.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml"/>"#,
+            );
+            let root = root_tag(&o, "<w:numbering")?;
+            format!("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n{}</w:numbering>", root.trim_end_matches("/>"))
+        }
+    };
+    merge_namespaces(&mut b, &o, "<w:numbering")?;
+    let abstracts = shift_ids(&abstracts, shift, true);
+    let nums = shift_ids(&nums, shift, true);
+    // abstractNum должны идти перед num.
+    let pos = b.find("<w:num ").unwrap_or_else(|| b.rfind("</w:numbering>").unwrap_or(b.len()));
+    b.insert_str(pos, &abstracts);
+    let pos = b.rfind("</w:numbering>").ok_or_else(|| anyhow!("повреждён numbering.xml"))?;
+    b.insert_str(pos, &nums);
+    base.set("word/numbering.xml", b.into_bytes());
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_docx(path: &Path, text: &str, with_image: bool) {
+        let f = std::fs::File::create(path).unwrap();
+        let mut z = zip::ZipWriter::new(f);
+        let o = zip::write::SimpleFileOptions::default();
+        let ns = r#"xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships""#;
+        let files = [
+            ("[Content_Types].xml", r#"<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="xml" ContentType="application/xml"/></Types>"#.to_string()),
+            ("word/_rels/document.xml.rels", if with_image {
+                r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/i.png"/></Relationships>"#.to_string()
+            } else {
+                r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"></Relationships>"#.to_string()
+            }),
+            ("word/document.xml", format!(
+                r#"<?xml version="1.0"?><w:document {ns}><w:body><w:p><w:r><w:t>{text}</w:t></w:r></w:p>{}<w:sectPr><w:pgSz w:w="1"/></w:sectPr></w:body></w:document>"#,
+                if with_image { r#"<w:p><w:r><w:drawing><a:blip r:embed="rId1"/></w:drawing></w:r></w:p>"# } else { "" }
+            )),
+        ];
+        for (n, c) in files {
+            z.start_file(n, o).unwrap();
+            z.write_all(c.as_bytes()).unwrap();
+        }
+        if with_image {
+            z.start_file("word/media/i.png", o).unwrap();
+            z.write_all(b"PNG").unwrap();
+        }
+        z.finish().unwrap();
+    }
+
+    #[test]
+    fn merges_text_images_and_page_breaks() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b, out) = (dir.path().join("a.docx"), dir.path().join("b.docx"), dir.path().join("o.docx"));
+        make_docx(&a, "ONE", false);
+        make_docx(&b, "TWO", true);
+        merge(&[a, b], &out).unwrap();
+        let d = Docx::read(&out).unwrap();
+        let doc = d.text(DOC).unwrap();
+        assert!(doc.find("ONE").unwrap() < doc.find("TWO").unwrap());
+        assert!(doc.contains(r#"w:type="page""#));
+        assert_eq!(doc.matches("<w:sectPr>").count(), 1);
+        assert!(doc.contains(r#"r:embed="rIdM1x0""#));
+        assert!(d.get("word/media/m1_i.png").is_some());
+        assert!(d.text(RELS).unwrap().contains(r#"Id="rIdM1x0""#));
+    }
+
+    #[test]
+    fn shifts_num_ids_but_not_zero() {
+        let s = r#"<w:numId w:val="0"/><w:numId w:val="3"/>"#;
+        assert_eq!(shift_ids(s, 1000, false), r#"<w:numId w:val="0"/><w:numId w:val="1003"/>"#);
     }
 }
