@@ -60,6 +60,8 @@ pub struct Job {
     pub target: Target,
     pub entries: Vec<JobEntry>,
     pub out: PathBuf,
+    /// Word: сохранять оформление каждого документа (см. `word::Options`).
+    pub keep_source_styles: bool,
 }
 
 pub struct Outcome {
@@ -239,7 +241,7 @@ pub fn run(job: &Job, cancel: &AtomicBool, progress: &dyn Fn(&str)) -> Result<Ou
             }
             check_cancel(cancel)?;
             progress("Объединение документов…");
-            warnings.extend(word::merge(&docs, &merged)?);
+            warnings.extend(word::merge(&docs, &merged, &word::Options { keep_source_styles: job.keep_source_styles })?);
         }
     }
 
@@ -302,7 +304,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let a = dir.path().join("a.docx");
         std::fs::write(&a, b"x").unwrap();
-        let mut job = Job { kind: Kind::Word, target: Target::Same, entries: vec![entry(&a)], out: a.clone() };
+        let mut job = Job { kind: Kind::Word, target: Target::Same, entries: vec![entry(&a)], out: a.clone(), keep_source_styles: true };
         assert!(validate(&job).unwrap_err().to_string().contains("совпадает"));
         job.out = dir.path().join("o.pdf");
         assert!(validate(&job).unwrap_err().to_string().contains(".docx"));

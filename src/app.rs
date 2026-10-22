@@ -299,7 +299,7 @@ impl App {
                 selected: e.sheets.iter().enumerate().filter(|(_, s)| s.selected).map(|(i, _)| i).collect(),
             })
             .collect();
-        let job = Job { kind, target: self.target, entries, out: out.clone() };
+        let job = Job { kind, target: self.target, entries, out: out.clone(), keep_source_styles: self.config.keep_source_styles };
         if let Err(e) = job::validate(&job) {
             self.error(format!("{e:#}"));
             return;
@@ -541,6 +541,18 @@ impl App {
     fn settings_window(&mut self, ctx: &egui::Context) {
         let mut open = self.show_settings;
         egui::Window::new("Настройки").open(&mut open).collapsible(false).resizable(false).show(ctx, |ui| {
+            ui.strong("Word");
+            if ui
+                .checkbox(&mut self.config.keep_source_styles, "Сохранять оформление каждого документа")
+                .on_hover_text(
+                    "Включено: стили, которые называются одинаково, но выглядят по-разному, не подменяются стилями первого документа.\n\
+                     Выключено: как при вставке файла в Word — все документы получают оформление первого.",
+                )
+                .changed()
+            {
+                self.config.save();
+            }
+            ui.separator();
             ui.strong("Интеграция с проводником");
             let mut on = self.menu == Some(MenuState::Installed);
             let enabled = shell::menu_supported() && self.menu_rx.is_none() && self.menu.is_some();

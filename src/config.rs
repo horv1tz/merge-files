@@ -2,11 +2,13 @@
 
 use std::path::PathBuf;
 
-#[derive(Default, Clone)]
+#[derive(Clone)]
 pub struct Config {
     /// Результат: "pdf" или пусто (тот же формат).
     pub target_pdf: bool,
     pub last_dir: Option<PathBuf>,
+    /// Word: сохранять оформление каждого документа.
+    pub keep_source_styles: bool,
 }
 
 fn path() -> Option<PathBuf> {
@@ -20,6 +22,12 @@ fn path() -> Option<PathBuf> {
     Some(base.join("MergeFiles").join("config.txt"))
 }
 
+impl Default for Config {
+    fn default() -> Self {
+        Config { target_pdf: false, last_dir: None, keep_source_styles: true }
+    }
+}
+
 impl Config {
     pub fn load() -> Config {
         let mut c = Config::default();
@@ -27,6 +35,7 @@ impl Config {
         for line in text.lines() {
             match line.split_once('=') {
                 Some(("target", v)) => c.target_pdf = v.trim() == "pdf",
+                Some(("keep_styles", v)) => c.keep_source_styles = v.trim() != "0",
                 Some(("last_dir", v)) if !v.trim().is_empty() => c.last_dir = Some(PathBuf::from(v.trim())),
                 _ => {}
             }
@@ -40,8 +49,9 @@ impl Config {
             let _ = std::fs::create_dir_all(dir);
         }
         let text = format!(
-            "target={}\nlast_dir={}\n",
+            "target={}\nkeep_styles={}\nlast_dir={}\n",
             if self.target_pdf { "pdf" } else { "same" },
+            u8::from(self.keep_source_styles),
             self.last_dir.as_ref().map(|d| d.to_string_lossy().into_owned()).unwrap_or_default()
         );
         let _ = std::fs::write(p, text);

@@ -112,7 +112,7 @@ fn cli(args: Vec<OsString>) -> anyhow::Result<()> {
             Ok(JobEntry { path: p, all_sheets, selected })
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
-    let job = Job { kind, target, entries, out };
+    let job = Job { kind, target, entries, out, keep_source_styles: true };
     let cancel = AtomicBool::new(false);
     let outcome = job::run(&job, &cancel, &|m| say(m, false))?;
     for w in outcome.warnings {

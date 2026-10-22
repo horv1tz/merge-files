@@ -2616,7 +2616,20 @@ impl Merger {
 }
 
 /// Объединяет документы `.docx` по порядку; возвращает предупреждения для пользователя.
-pub fn merge(inputs: &[PathBuf], out: &Path) -> Result<Vec<String>> {
+/// Параметры объединения документов.
+#[derive(Clone, Debug)]
+pub struct Options {
+    /// Сохранять оформление каждого документа (стили с одним именем, но разным видом не подменяются стилями первого).
+    pub keep_source_styles: bool,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Options { keep_source_styles: true }
+    }
+}
+
+pub fn merge(inputs: &[PathBuf], out: &Path, _opts: &Options) -> Result<Vec<String>> {
     let (first, rest) = inputs.split_first().ok_or_else(|| anyhow!("нет файлов"))?;
     let base = Src::load(first)?;
     let mut m = Merger::new(base).with_context(|| format!("при разборе {}", first.display()))?;
