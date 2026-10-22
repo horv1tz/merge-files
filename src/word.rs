@@ -2766,7 +2766,7 @@ mod tests {
             paths.push(p);
         }
         let out = dir.join(format!("{name}_out.docx"));
-        let w = merge(&paths, &out).unwrap();
+        let w = merge(&paths, &out, &Options::default()).unwrap();
         let errs = check(&out);
         assert!(errs.is_empty(), "{name}: пакет некорректен: {errs:#?}");
         (out, w)
@@ -3030,10 +3030,10 @@ mod tests {
         let c_path = dir.path().join("c.docx");
         c.write(&c_path);
         let out = dir.path().join("abc.docx");
-        merge(&[ab.clone(), c_path.clone()], &out).unwrap();
+        merge(&[ab.clone(), c_path.clone()], &out, &Options::default()).unwrap();
         assert!(check(&out).is_empty(), "{:?}", check(&out));
         let out2 = dir.path().join("cab.docx");
-        merge(&[c_path, ab], &out2).unwrap();
+        merge(&[c_path, ab], &out2, &Options::default()).unwrap();
         assert!(check(&out2).is_empty());
         for (o, order) in [(&out, [1u8, 2, 3]), (&out2, [3, 1, 2])] {
             let (pkg, d) = doc_of(o);
@@ -3329,7 +3329,7 @@ mod tests {
         let pa = dir.path().join("a.docx");
         a.write(&pa);
         let out = dir.path().join("o.docx");
-        merge(&[pa.clone(), p], &out).unwrap();
+        merge(&[pa.clone(), p], &out, &Options::default()).unwrap();
         assert!(check(&out).is_empty(), "{:?}", check(&out));
         let (_, d) = doc_of(&out);
         assert_eq!(texts(d.root.child("w:body").unwrap()), ["A", "PFX"]);
@@ -3339,7 +3339,7 @@ mod tests {
         s.ns = NS.replace("http://schemas.openxmlformats.org/wordprocessingml/2006/main", "http://purl.oclc.org/ooxml/wordprocessingml/main");
         let ps = dir.path().join("s.docx");
         s.write(&ps);
-        let err = merge(&[pa, ps], &dir.path().join("e.docx")).unwrap_err();
+        let err = merge(&[pa, ps], &dir.path().join("e.docx"), &Options::default()).unwrap_err();
         assert!(format!("{err:#}").contains("Strict"));
     }
 
@@ -3378,12 +3378,12 @@ mod tests {
         let src = dir.path().join("single.docx");
         a.write(&src);
         let o = dir.path().join("single_out.docx");
-        assert!(merge(&[src.clone()], &o).unwrap().is_empty());
+        assert!(merge(&[src.clone()], &o, &Options::default()).unwrap().is_empty());
         let (p1, p2) = (Pkg::read(&src).unwrap(), Pkg::read(&o).unwrap());
         for (n, d) in &p1.entries {
             assert_eq!(p2.get(n).unwrap(), d.as_slice(), "{n}");
         }
-        assert!(merge(&[], &o).is_err());
+        assert!(merge(&[], &o, &Options::default()).is_err());
     }
 
     #[test]
