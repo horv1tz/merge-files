@@ -19,7 +19,7 @@ fn find_soffice() -> Option<PathBuf> {
             if p.exists() {
                 return Some(p);
             }
-        } else if Command::new(&p).arg("--version").output().is_ok() {
+        } else if crate::shell::hide_window(&mut Command::new(&p)).arg("--version").output().is_ok() {
             return Some(p);
         }
     }
@@ -37,7 +37,9 @@ pub fn convert(input: &Path, fmt: &str, out_dir: &Path) -> Result<PathBuf> {
     let profile = out_dir.join("lo-profile");
     let url = profile.to_string_lossy().replace('\\', "/");
     let url = format!("file://{}{}", if url.starts_with('/') { "" } else { "/" }, url);
-    let status = Command::new(soffice)
+    let mut cmd = Command::new(soffice);
+    crate::shell::hide_window(&mut cmd);
+    let status = cmd
         .arg("--headless")
         .arg(format!("-env:UserInstallation={url}"))
         .args(["--convert-to", fmt, "--outdir"])
@@ -83,7 +85,9 @@ fn convert_with_office(input: &Path, fmt: &str, out_dir: &Path) -> Result<PathBu
         }
         _ => bail!("неподдерживаемое преобразование"),
     };
-    let r = Command::new("powershell")
+    let mut cmd = Command::new("powershell");
+    crate::shell::hide_window(&mut cmd);
+    let r = cmd
         .args(["-NoProfile", "-NonInteractive", "-Command", &script])
         .env("MF_IN", input)
         .env("MF_OUT", &out)

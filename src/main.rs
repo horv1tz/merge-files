@@ -2,6 +2,7 @@
 
 mod excel;
 mod pdf;
+mod shell;
 mod word;
 
 use eframe::egui;
@@ -48,11 +49,13 @@ struct App {
     status: String,
     is_error: bool,
     rx: Option<Receiver<Result<PathBuf, String>>>,
+    incoming: Option<Receiver<Vec<PathBuf>>>,
+    menu_installed: bool,
 }
 
 impl App {
     fn new() -> Self {
-        App { entries: vec![], kind: None, target: Target::Same, status: String::new(), is_error: false, rx: None }
+        App { entries: vec![], kind: None, target: Target::Same, status: String::new(), is_error: false, rx: None, incoming: None, menu_installed: shell::menu_installed() }
     }
 
     fn error(&mut self, msg: String) {
@@ -87,6 +90,12 @@ impl App {
         if self.entries.is_empty() {
             self.kind = None;
         }
+    }
+
+    /// Файлы из контекстного меню: добавляем и упорядочиваем по имени (естественная сортировка).
+    fn add_from_shell(&mut self, paths: Vec<PathBuf>) {
+        self.add(paths);
+        self.entries.sort_by_key(|e| shell::natural_key(&e.path.file_name().unwrap_or_default().to_string_lossy()));
     }
 
     fn merge(&mut self, ctx: &egui::Context) {
@@ -177,6 +186,18 @@ impl eframe::App for App {
         let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| Some(f.path().to_path_buf())).collect());
         if !dropped.is_empty() {
             self.add(dropped);
+        }
+        let mut batches = vec![];
+        if let Some(rx) = &self.incoming {
+            while let Ok(b) = rx.try_recv() {
+                batches.push(b);
+            }
+        }
+        if !batches.is_empty() {
+            for b in batches {
+                self.add_from_shell(b);
+            }
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         }
         if let Some(rx) = &self.rx {
             if let Ok(r) = rx.try_recv() {
@@ -291,6 +312,27 @@ impl eframe::App for App {
             if ui.add_enabled(ready && !busy, egui::Button::new("Объединить…").min_size([160.0, 32.0].into())).clicked() {
                 self.merge(&ctx);
             }
+            if shell::menu_supported() {
+                ui.horizontal(|ui| {
+                    if self.menu_installed {
+                        if ui.small_button("Убрать из контекстного меню").clicked() {
+                            match shell::uninstall_menu() {
+                                Ok(()) => self.menu_installed = shell::menu_installed(),
+                                Err(e) => self.error(format!("{e:#}")),
+                            }
+                        }
+                    } else if ui.small_button("Добавить в контекстное меню проводника").clicked() {
+                        match shell::install_menu() {
+                            Ok(()) => {
+                                self.menu_installed = shell::menu_installed();
+                                self.status = "Пункт «Объединить файлы…» добавлен в меню файлов".into();
+                                self.is_error = false;
+                            }
+                            Err(e) => self.error(format!("{e:#}")),
+                        }
+                    }
+                });
+            }
             if self.target == Target::Pdf || self.entries.iter().any(|e| e.path.extension().is_some_and(|x| x == "doc")) {
                 ui.weak("PDF, .doc, .xls и .ods требуют LibreOffice (в Windows подойдёт и Microsoft Office).");
             }
@@ -325,16 +367,50 @@ fn cli(args: Vec<String>) -> anyhow::Result<()> {
 
 fn main() -> eframe::Result {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if !args.is_empty() {
-        if let Err(e) = cli(args) {
-            eprintln!("Ошибка: {e:#}");
-            std::process::exit(1);
-        }
-        return Ok(());
+    match args.first().map(String::as_str) {
+        Some("--install-menu") => return cli_result(shell::install_menu()),
+        Some("--uninstall-menu") => return cli_result(shell::uninstall_menu()),
+        _ if args.iter().any(|a| a == "-o") => return cli_result(cli(args)),
+        _ => {}
     }
+
+    // Остальные аргументы — файлы (запуск из контекстного меню).
+    let initial: Vec<PathBuf> = args.into_iter().map(PathBuf::from).collect();
+    let listener = match shell::claim(&initial) {
+        shell::Role::Forwarded => return Ok(()),
+        shell::Role::Primary(l) => Some(l),
+        shell::Role::Standalone => None,
+    };
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([560.0, 520.0]).with_drag_and_drop(true),
+        viewport: egui::ViewportBuilder::default().with_inner_size([560.0, 540.0]).with_drag_and_drop(true),
         ..Default::default()
     };
-    eframe::run_native("Merge Files", options, Box::new(|_cc| Ok(Box::new(App::new()))))
+    eframe::run_native(
+        "Merge Files",
+        options,
+        Box::new(move |cc| {
+            let mut app = App::new();
+            if let Some(l) = listener {
+                let (tx, rx) = channel();
+                let ctx = cc.egui_ctx.clone();
+                shell::serve(l, move |batch| {
+                    let _ = tx.send(batch);
+                    ctx.request_repaint();
+                });
+                app.incoming = Some(rx);
+            }
+            if !initial.is_empty() {
+                app.add_from_shell(initial);
+            }
+            Ok(Box::new(app))
+        }),
+    )
+}
+
+fn cli_result(r: anyhow::Result<()>) -> eframe::Result {
+    if let Err(e) = r {
+        eprintln!("Ошибка: {e:#}");
+        std::process::exit(1);
+    }
+    Ok(())
 }
