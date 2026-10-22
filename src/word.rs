@@ -9,13 +9,20 @@
 //! стилей и абзацев) выбираются так, чтобы не пересекаться с уже существующими, поэтому результат
 //! слияния можно снова использовать как входной файл.
 //!
+//! Оформление: по умолчанию (`Options::keep_source_styles`) каждый документ выглядит так же, как и
+//! отдельно. Стиль с тем же именем, но другим определением добавляется под новым именем
+//! («Заголовок 1 (2)»), ссылки на него переписываются, нумерация, заданная стилем, получает свой
+//! список (и начинается заново в каждом документе), отличия docDefaults/«обычного» стиля/темы
+//! переносятся в добавленные стили. Одинаковые стили по-прежнему сливаются в один. Режим «как в Word»
+//! (`keep_source_styles: false`): побеждают стили первого документа, о замене предупреждается.
+//!
 //! Что не переносится без потерь, не пропадает молча: `merge` возвращает предупреждения для
-//! пользователя. Это: стили с тем же именем, но другим оформлением (используется стиль первого
-//! документа), «шрифт по умолчанию», тема, настройки всего документа (зеркальные поля, разные
-//! колонтитулы чётных/нечётных страниц), встроенные шрифты, привязка элементов управления к
-//! данным, «битые» ссылки исходных файлов. Формат Strict Open XML не поддерживается (ошибка).
+//! пользователя. Это: настройки, общие для всего файла (зеркальные поля, фон страницы, режим
+//! совместимости), встроенные шрифты, привязка элементов управления к данным, «битые» ссылки
+//! исходных файлов, обновление полей (оглавление). Формат Strict Open XML не поддерживается (ошибка).
+//! Повреждённые файлы (обрезанный архив, неправильный XML) отклоняются с понятным сообщением.
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Result, anyhow, bail};
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -181,12 +188,80 @@ mod xml {
         }
     }
 
-    pub fn parse(data: &[u8]) -> Result<Doc> {
-        let data = data.strip_prefix(&[0xEF, 0xBB, 0xBF][..]).unwrap_or(data);
-        if data.starts_with(&[0xFF, 0xFE]) || data.starts_with(&[0xFE, 0xFF]) {
-            bail!("XML в кодировке UTF-16 не поддерживается");
+    /// Допустимый в XML 1.0 символ.
+    fn is_xml_char(c: char) -> bool {
+        matches!(c, '\t' | '\n' | '\r' | '\u{20}'..='\u{D7FF}' | '\u{E000}'..='\u{FFFD}' | '\u{10000}'..='\u{10FFFF}')
+    }
+
+    /// Байты части XML -> текст: UTF-8 (с BOM или без) и UTF-16 (с BOM или без; OPC допускает обе кодировки).
+    pub fn decode(data: &[u8]) -> Result<String> {
+        let utf16 = if data.starts_with(&[0xFF, 0xFE]) {
+            Some((false, &data[2..]))
+        } else if data.starts_with(&[0xFE, 0xFF]) {
+            Some((true, &data[2..]))
+        } else if data.len() >= 2 && data[0] == b'<' && data[1] == 0 {
+            Some((false, data))
+        } else if data.len() >= 2 && data[0] == 0 && data[1] == b'<' {
+            Some((true, data))
+        } else {
+            None
+        };
+        if let Some((be, body)) = utf16 {
+            if body.len() % 2 != 0 {
+                bail!("XML обрезан: файл оборван на середине символа (UTF-16)");
+            }
+            let units = body.chunks_exact(2).map(|c| if be { u16::from_be_bytes([c[0], c[1]]) } else { u16::from_le_bytes([c[0], c[1]]) });
+            return char::decode_utf16(units)
+                .collect::<std::result::Result<String, _>>()
+                .map_err(|_| anyhow!("XML (UTF-16) содержит недопустимые символы — файл повреждён"));
         }
-        let s = std::str::from_utf8(data).map_err(|_| anyhow!("XML не в кодировке UTF-8"))?;
+        let data = data.strip_prefix(&[0xEF, 0xBB, 0xBF][..]).unwrap_or(data);
+        match std::str::from_utf8(data) {
+            Ok(s) => Ok(s.to_string()),
+            // Оборванный на середине символа конец — признак обрезанного файла, а не другой кодировки.
+            Err(e) if e.error_len().is_none() => bail!("XML обрезан: файл оборван на середине символа"),
+            Err(_) => bail!("XML содержит байты, недопустимые в UTF-8 (файл повреждён или сохранён в другой кодировке)"),
+        }
+    }
+
+    /// Проверяет текст или значение атрибута: ссылки на сущности и допустимость символов.
+    fn check_text(s: &str) -> Result<()> {
+        let b = s.as_bytes();
+        let mut i = 0;
+        while i < b.len() {
+            match b[i] {
+                b'&' => {
+                    let end = b[i + 1..].iter().take(12).position(|&x| x == b';');
+                    let ent = end.map(|j| &s[i + 1..i + 1 + j]);
+                    let ok = match ent {
+                        Some("lt" | "gt" | "amp" | "quot" | "apos") => true,
+                        Some(e) => e
+                            .strip_prefix("#x")
+                            .and_then(|h| u32::from_str_radix(h, 16).ok().filter(|_| h.bytes().all(|c| c.is_ascii_hexdigit())))
+                            .or_else(|| e.strip_prefix('#').and_then(|d| d.parse::<u32>().ok().filter(|_| d.bytes().all(|c| c.is_ascii_digit()))))
+                            .and_then(char::from_u32)
+                            .is_some_and(is_xml_char),
+                        None => false,
+                    };
+                    if !ok {
+                        let shown: String = s[i..].chars().take_while(|c| !c.is_whitespace() && *c != '<').take(10).collect();
+                        bail!("XML повреждён: недопустимая ссылка «{shown}» (символ «&» нужно записывать как «&amp;»)");
+                    }
+                    i += end.map_or(1, |j| j + 2);
+                }
+                0..=8 | 11 | 12 | 14..=31 => bail!("XML повреждён: недопустимый управляющий символ (код {})", b[i]),
+                _ => i += 1,
+            }
+        }
+        if !s.is_ascii() && !s.chars().all(is_xml_char) {
+            bail!("XML повреждён: недопустимый символ");
+        }
+        Ok(())
+    }
+
+    pub fn parse(data: &[u8]) -> Result<Doc> {
+        let text = decode(data)?;
+        let s = text.as_str();
         let b = s.as_bytes();
         let mut i = 0;
         let mut stack: Vec<Elem> = vec![];
@@ -198,7 +273,10 @@ mod xml {
                 let j = s[i..].find('<').map(|x| x + i).unwrap_or(b.len());
                 let t = &s[i..j];
                 match stack.last_mut() {
-                    Some(p) => p.children.push(Node::Text(t.to_string())),
+                    Some(p) => {
+                        check_text(t)?;
+                        p.children.push(Node::Text(t.to_string()))
+                    }
                     None if !t.trim().is_empty() => bail!("XML повреждён: текст вне корневого элемента"),
                     None => {}
                 }
@@ -207,7 +285,7 @@ mod xml {
             }
             let rest = &s[i..];
             if rest.starts_with("<!--") {
-                let e = rest.find("-->").ok_or_else(|| anyhow!("XML повреждён: не закрыт комментарий"))? + 3;
+                let e = rest.find("-->").ok_or_else(|| anyhow!("XML обрезан: не закрыт комментарий"))? + 3;
                 if let Some(p) = stack.last_mut() {
                     p.children.push(Node::Raw(rest[..e].to_string()));
                 } else if root.is_none() {
@@ -215,14 +293,14 @@ mod xml {
                 }
                 i += e;
             } else if rest.starts_with("<![CDATA[") {
-                let e = rest.find("]]>").ok_or_else(|| anyhow!("XML повреждён: не закрыт CDATA"))? + 3;
+                let e = rest.find("]]>").ok_or_else(|| anyhow!("XML обрезан: не закрыт блок CDATA"))? + 3;
                 match stack.last_mut() {
                     Some(p) => p.children.push(Node::Raw(rest[..e].to_string())),
                     None => bail!("XML повреждён: CDATA вне корневого элемента"),
                 }
                 i += e;
             } else if rest.starts_with("<?") {
-                let e = rest.find("?>").ok_or_else(|| anyhow!("XML повреждён: не закрыта инструкция"))? + 2;
+                let e = rest.find("?>").ok_or_else(|| anyhow!("XML обрезан: не закрыта инструкция обработки"))? + 2;
                 let raw = &rest[..e];
                 if let Some(p) = stack.last_mut() {
                     p.children.push(Node::Raw(raw.to_string()));
@@ -233,7 +311,7 @@ mod xml {
             } else if rest.starts_with("<!") {
                 bail!("XML с DOCTYPE не поддерживается");
             } else if rest.starts_with("</") {
-                let e = rest.find('>').ok_or_else(|| anyhow!("XML повреждён: не закрыт тег"))?;
+                let e = rest.find('>').ok_or_else(|| anyhow!("XML обрезан: не закрыт тег"))?;
                 let name = rest[2..e].trim();
                 let el = stack.pop().ok_or_else(|| anyhow!("XML повреждён: лишний закрывающий тег </{name}>"))?;
                 if el.name != name {
@@ -266,7 +344,7 @@ mod xml {
                         j += 1;
                     }
                     if j >= tb.len() {
-                        bail!("XML повреждён: не закрыт тег <{}", el.name);
+                        bail!("XML обрезан: не закрыт тег <{}", el.name);
                     }
                     if tb[j] == b'>' {
                         self_closing = false;
@@ -296,7 +374,7 @@ mod xml {
                     while j < tb.len() && is_ws(tb[j]) {
                         j += 1;
                     }
-                    let q = *tb.get(j).ok_or_else(|| anyhow!("XML повреждён: обрыв в теге"))?;
+                    let q = *tb.get(j).ok_or_else(|| anyhow!("XML обрезан: оборван тег <{}", el.name))?;
                     if q != b'"' && q != b'\'' {
                         bail!("XML повреждён: значение атрибута {an} без кавычек");
                     }
@@ -306,7 +384,14 @@ mod xml {
                         j += 1;
                     }
                     if j >= tb.len() {
-                        bail!("XML повреждён: не закрыто значение атрибута {an}");
+                        bail!("XML обрезан: не закрыто значение атрибута {an}");
+                    }
+                    check_text(&rest[vs..j])?;
+                    if rest[vs..j].contains('<') {
+                        bail!("XML повреждён: символ «<» внутри значения атрибута {an}");
+                    }
+                    if el.attrs.iter().any(|(n, _)| *n == an) {
+                        bail!("XML повреждён: атрибут {an} повторяется в <{}>", el.name);
                     }
                     el.attrs.push((an, unescape(&rest[vs..j])));
                     j += 1;
@@ -331,9 +416,9 @@ mod xml {
             }
         }
         if let Some(e) = stack.last() {
-            bail!("XML повреждён: не закрыт <{}>", e.name);
+            bail!("XML обрезан: не закрыт элемент <{}>", e.name);
         }
-        Ok(Doc { prolog, root: root.ok_or_else(|| anyhow!("XML пуст"))? })
+        Ok(Doc { prolog, root: root.ok_or_else(|| anyhow!("XML пуст или обрезан"))? })
     }
 
     fn write_elem(e: &Elem, o: &mut String) {
@@ -396,6 +481,37 @@ mod xml {
 
 // ───────────────────────────── Пакет OPC ─────────────────────────────
 
+/// Ошибка ввода-вывода без «сырого» системного текста.
+fn io_msg(e: &std::io::Error) -> String {
+    use std::io::ErrorKind as K;
+    match e.kind() {
+        K::NotFound => "файл не найден".into(),
+        K::PermissionDenied => "нет доступа к файлу (возможно, он открыт в другой программе)".into(),
+        K::UnexpectedEof => "файл обрезан (неожиданный конец данных)".into(),
+        K::InvalidData => "данные повреждены (ошибка контрольной суммы или сжатия)".into(),
+        _ => match e.raw_os_error() {
+            Some(c) => format!("ошибка ввода-вывода (код {c})"),
+            None => "ошибка ввода-вывода".into(),
+        },
+    }
+}
+
+fn zip_msg(e: &zip::result::ZipError) -> String {
+    use zip::result::ZipError as Z;
+    match e {
+        Z::Io(e) => io_msg(e),
+        Z::InvalidPassword => "документ защищён паролем".into(),
+        Z::UnsupportedArchive(m) if m.to_lowercase().contains("password") => "документ защищён паролем".into(),
+        Z::UnsupportedArchive(_) | Z::CompressionMethodNotSupported(_) => "неподдерживаемый вариант архива ZIP".into(),
+        _ => "файл повреждён (обрезан или не является архивом ZIP)".into(),
+    }
+}
+
+/// Ошибка разбора части пакета для пользователя.
+fn part_err(part: &str, e: impl std::fmt::Display) -> anyhow::Error {
+    anyhow!("часть «{part}» повреждена: {e}")
+}
+
 struct Pkg {
     entries: Vec<(String, Vec<u8>)>,
     idx: HashMap<String, usize>,
@@ -408,13 +524,12 @@ impl Pkg {
     }
 
     fn read(path: &Path) -> Result<Pkg> {
-        let f = std::fs::File::open(path).with_context(|| format!("не удалось открыть {}", path.display()))?;
-        let mut zip = zip::ZipArchive::new(f)
-            .with_context(|| format!("{} — не docx (файл повреждён или защищён паролем)", path.display()))?;
+        let f = std::fs::File::open(path).map_err(|e| anyhow!("не удалось открыть файл: {}", io_msg(&e)))?;
+        let mut zip = zip::ZipArchive::new(f).map_err(|e| anyhow!("{}", zip_msg(&e)))?;
         let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
         let mut seen = HashSet::new();
         for i in 0..zip.len() {
-            let mut e = zip.by_index(i).with_context(|| format!("{} — не удалось прочитать архив", path.display()))?;
+            let mut e = zip.by_index(i).map_err(|er| anyhow!("не удалось прочитать запись №{} архива: {}", i + 1, zip_msg(&er)))?;
             if e.is_dir() {
                 continue;
             }
@@ -424,7 +539,7 @@ impl Pkg {
                 continue;
             }
             let mut buf = Vec::new();
-            e.read_to_end(&mut buf)?;
+            e.read_to_end(&mut buf).map_err(|er| anyhow!("файл повреждён: не удалось прочитать «{name}» — {}", io_msg(&er)))?;
             entries.push((name, buf));
         }
         Ok(Pkg::from_entries(entries))
@@ -450,7 +565,7 @@ impl Pkg {
     }
 
     fn write(&self, path: &Path) -> Result<()> {
-        let f = std::fs::File::create(path).with_context(|| format!("не удалось создать {}", path.display()))?;
+        let f = std::fs::File::create(path).map_err(|e| anyhow!("не удалось создать файл «{}»: {}", path.display(), io_msg(&e)))?;
         let mut zip = zip::ZipWriter::new(std::io::BufWriter::new(f));
         let opts = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
         // [Content_Types].xml и корневые связи — первыми, остальное в исходном порядке.
@@ -467,10 +582,11 @@ impl Pkg {
             }
         }
         for (name, data) in order {
-            zip.start_file(name.as_str(), opts.large_file(data.len() as u64 > 3_900_000_000))?;
-            zip.write_all(data)?;
+            zip.start_file(name.as_str(), opts.large_file(data.len() as u64 > 3_900_000_000))
+                .map_err(|e| anyhow!("не удалось записать результат: {}", zip_msg(&e)))?;
+            zip.write_all(data).map_err(|e| anyhow!("не удалось записать результат: {}", io_msg(&e)))?;
         }
-        zip.finish()?.flush()?;
+        zip.finish().map_err(|e| anyhow!("не удалось записать результат: {}", zip_msg(&e)))?.flush().map_err(|e| anyhow!("не удалось записать результат: {}", io_msg(&e)))?;
         Ok(())
     }
 }
@@ -773,106 +889,170 @@ fn is_canon_prefix(p: &str) -> bool {
     CANON.iter().any(|(_, c)| *c == p)
 }
 
-fn rename_tokens(v: &str, map: &HashMap<String, String>) -> String {
-    v.split_whitespace().map(|t| map.get(t).map(|s| s.as_str()).unwrap_or(t)).collect::<Vec<_>>().join(" ")
+/// Токены-префиксы в значении `mc:Ignorable` / `Requires` -> общепринятые префиксы.
+fn map_prefix_tokens(v: &str, f: &dyn Fn(&str) -> Option<String>) -> String {
+    v.split_whitespace().map(|t| f(t).unwrap_or_else(|| t.to_string())).collect::<Vec<_>>().join(" ")
 }
 
-fn rename_prefixes(e: &mut Elem, map: &HashMap<String, String>) {
-    if let Some((p, l)) = e.name.split_once(':') {
-        if let Some(t) = map.get(p) {
-            e.name = format!("{t}:{l}");
-        }
-    }
-    for (k, v) in e.attrs.iter_mut() {
-        if let Some(p) = k.strip_prefix("xmlns:") {
-            if let Some(t) = map.get(p) {
-                *k = format!("xmlns:{t}");
+/// Приводит все префиксы пространств имён документа к общепринятым (`w`, `r`, `wp`, ...), чтобы остальной
+/// код мог опираться на имена вида `w:p`: учитываются объявления на любой глубине и пространство имён по
+/// умолчанию (`xmlns="…"`, элементы без префикса), все объявления собираются в корне. Атрибуты без
+/// префикса не принадлежат никакому пространству имён и не меняются.
+fn normalize_ns(root: &mut Elem) -> Result<()> {
+    let root_ptr = root as *const Elem;
+    // Быстрый путь: всё уже в общепринятом виде.
+    let mut simple = true;
+    let mut decls: Vec<(String, String)> = vec![];
+    xml::walk_ref(root, &mut |e| {
+        let is_root = std::ptr::eq(e, root_ptr);
+        for (k, v) in &e.attrs {
+            if k == "xmlns" {
+                simple = false;
+            } else if let Some(p) = k.strip_prefix("xmlns:") {
+                decls.push((p.to_string(), v.clone()));
+                let canon = canon_prefix(v);
+                if !is_root || canon.is_some_and(|c| c != p) || (is_canon_prefix(p) && canon != Some(p)) {
+                    simple = false;
+                }
             }
-        } else if let Some((p, l)) = k.split_once(':') {
-            if l == "Ignorable" || l == "Requires" {
-                *v = rename_tokens(v, map);
-            }
-            if let Some(t) = map.get(p) {
-                *k = format!("{t}:{l}");
-            }
         }
+    });
+    if simple {
+        return check_prefixes(root, &decls);
     }
-    for n in e.children.iter_mut() {
-        if let Node::Elem(c) = n {
-            rename_prefixes(c, map);
-        }
-    }
-}
-
-/// Приводит префиксы пространств имён корня к общепринятым (`w`, `r`, `wp`, ...), чтобы остальной
-/// код мог опираться на имена вида `w:p`. Strict OOXML и пространство имён по умолчанию не поддерживаются.
-fn harmonize(doc: &mut xml::Doc) -> Result<()> {
-    let root = &mut doc.root;
-    if !root.name.contains(':') {
-        bail!("неподдерживаемая структура XML (пространство имён по умолчанию)");
-    }
-    let decls: Vec<(String, String)> = root
-        .attrs
-        .iter()
-        .filter_map(|(k, v)| k.strip_prefix("xmlns:").map(|p| (p.to_string(), v.clone())))
-        .collect();
-    if decls.iter().any(|(_, u)| u.starts_with("http://purl.oclc.org/ooxml/")) {
-        bail!("формат Strict Open XML не поддерживается (сохраните документ как обычный .docx)");
-    }
-    let mut rename: HashMap<String, String> = HashMap::new();
-    let mut taken: HashMap<String, String> = HashMap::new();
-    for (p, u) in &decls {
+    // Итоговый префикс для каждого адреса.
+    let mut chosen: HashMap<String, String> = HashMap::new();
+    let mut taken: HashSet<String> = HashSet::new();
+    for (_, u) in &decls {
         if let Some(c) = canon_prefix(u) {
-            taken.insert(c.to_string(), u.clone());
-            if p != c {
-                rename.insert(p.clone(), c.to_string());
-            }
+            chosen.insert(u.clone(), c.to_string());
+            taken.insert(c.to_string());
         }
     }
     let mut n = 0;
-    for (p, u) in &decls {
-        if canon_prefix(u).is_some() {
+    let mut want: Vec<(String, String)> = decls.clone();
+    // Адреса из xmlns="…" тоже нужны в таблице.
+    xml::walk_ref(root, &mut |e| {
+        if let Some(u) = e.attr("xmlns") {
+            if !u.is_empty() {
+                want.push((String::new(), u.to_string()));
+            }
+        }
+    });
+    for (p, u) in &want {
+        if chosen.contains_key(u) {
             continue;
         }
         let mut t = p.clone();
-        while is_canon_prefix(&t) || taken.get(&t).is_some_and(|x| x != u) {
+        while t.is_empty() || is_canon_prefix(&t) || taken.contains(&t) {
             n += 1;
             t = format!("x{n}");
         }
-        taken.insert(t.clone(), u.clone());
-        if &t != p {
-            rename.insert(p.clone(), t);
+        taken.insert(t.clone());
+        chosen.insert(u.clone(), t);
+    }
+
+    fn lookup<'a>(scope: &'a [(String, String)], p: &str) -> Option<&'a str> {
+        scope.iter().rev().find(|(k, _)| k == p).map(|(_, v)| v.as_str())
+    }
+    fn rw(e: &mut Elem, scope: &mut Vec<(String, String)>, chosen: &HashMap<String, String>) -> Result<()> {
+        let mark = scope.len();
+        for (k, v) in &e.attrs {
+            if k == "xmlns" {
+                scope.push((String::new(), v.clone()));
+            } else if let Some(p) = k.strip_prefix("xmlns:") {
+                scope.push((p.to_string(), v.clone()));
+            }
+        }
+        let map_name = |name: &str, scope: &[(String, String)], is_attr: bool| -> Result<Option<String>> {
+            match name.split_once(':') {
+                Some(("xml", _)) | Some(("xmlns", _)) => Ok(None),
+                Some((p, l)) => {
+                    let u = lookup(scope, p).ok_or_else(|| anyhow!("XML повреждён: префикс «{p}:» не объявлен"))?;
+                    Ok(Some(format!("{}:{l}", chosen.get(u).map(String::as_str).unwrap_or(p))))
+                }
+                None if is_attr => Ok(None),
+                None => Ok(match lookup(scope, "") {
+                    Some(u) if !u.is_empty() => chosen.get(u).map(|c| format!("{c}:{name}")),
+                    _ => None,
+                }),
+            }
+        };
+        if let Some(n) = map_name(&e.name, scope, false)? {
+            e.name = n;
+        }
+        let tokens = |v: &str, scope: &[(String, String)]| {
+            map_prefix_tokens(v, &|t| lookup(scope, t).and_then(|u| chosen.get(u)).cloned())
+        };
+        let is_choice = e.name == "mc:Choice";
+        let old = std::mem::take(&mut e.attrs);
+        for (k, v) in old {
+            if k == "xmlns" || k.starts_with("xmlns:") {
+                continue;
+            }
+            let nk = map_name(&k, scope, true)?.unwrap_or_else(|| k.clone());
+            let nv = if nk == "mc:Ignorable" || nk == "mc:ProcessContent" || nk == "mc:PreserveElements" || (is_choice && nk == "Requires") {
+                tokens(&v, scope)
+            } else {
+                v
+            };
+            e.attrs.push((nk, nv));
+        }
+        for c in e.children.iter_mut() {
+            if let Node::Elem(c) = c {
+                rw(c, scope, chosen)?;
+            }
+        }
+        scope.truncate(mark);
+        Ok(())
+    }
+    rw(root, &mut vec![], &chosen)?;
+    // Объявления - в корне: сначала в порядке первого появления, затем остальные атрибуты.
+    let mut seen = HashSet::new();
+    let mut head: Vec<(String, String)> = vec![];
+    for (_, u) in decls.iter().chain(want.iter()) {
+        if let Some(p) = chosen.get(u) {
+            if seen.insert(p.clone()) {
+                head.push((format!("xmlns:{p}"), u.clone()));
+            }
         }
     }
-    // Объявления внутри документа: допустимы, только если они не конфликтуют с общепринятыми префиксами.
-    let mut nested = false;
+    head.extend(std::mem::take(&mut root.attrs));
+    root.attrs = head;
+    Ok(())
+}
+
+/// Все ли префиксы элементов и атрибутов объявлены (иначе XML не является корректным).
+fn check_prefixes(root: &Elem, decls: &[(String, String)]) -> Result<()> {
+    let declared: HashSet<&str> = decls.iter().map(|(p, _)| p.as_str()).collect();
     let mut bad: Option<String> = None;
-    let root_ptr = root as *const Elem;
     xml::walk_ref(root, &mut |e| {
-        if std::ptr::eq(e, root_ptr) {
-            return;
-        }
-        for (k, v) in &e.attrs {
-            if let Some(p) = k.strip_prefix("xmlns:") {
-                nested = true;
-                if is_canon_prefix(p) && canon_prefix(v) != Some(p) {
+        let names = std::iter::once(e.name.as_str()).chain(e.attrs.iter().map(|(k, _)| k.as_str()));
+        for n in names {
+            if let Some((p, _)) = n.split_once(':') {
+                if p != "xml" && p != "xmlns" && !declared.contains(p) && bad.is_none() {
                     bad = Some(p.to_string());
                 }
             }
         }
     });
-    if let Some(p) = bad {
-        bail!("неподдерживаемая структура XML (префикс {p} переопределён внутри документа)");
+    match bad {
+        Some(p) => bail!("XML повреждён: префикс «{p}:» не объявлен"),
+        None => Ok(()),
     }
-    if !rename.is_empty() {
-        if nested {
-            bail!("неподдерживаемая структура XML (нестандартные префиксы пространств имён)");
-        }
-        rename_prefixes(root, &rename);
-        let mut seen = HashSet::new();
-        root.attrs.retain(|(k, _)| !k.starts_with("xmlns:") || seen.insert(k.clone()));
+}
+
+/// Приводит документ к виду, на который опирается остальной код (см. `normalize_ns`).
+/// Strict Open XML не поддерживается.
+fn harmonize(doc: &mut xml::Doc) -> Result<()> {
+    let mut strict = false;
+    xml::walk_ref(&doc.root, &mut |e| {
+        strict |= e.attrs.iter().any(|(k, v)| k.starts_with("xmlns") && v.starts_with("http://purl.oclc.org/ooxml/"));
+    });
+    if strict {
+        bail!("формат Strict Open XML не поддерживается (сохраните документ как обычный .docx)");
     }
-    Ok(())
+    normalize_ns(&mut doc.root)
 }
 
 /// Добавляет в `dst` объявления xmlns и `mc:Ignorable` из `src`.
@@ -1137,9 +1317,12 @@ impl Src {
     fn load(path: &Path) -> Result<Src> {
         let pkg = Pkg::read(path)?;
         let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        let types = Types::parse(pkg.get("[Content_Types].xml").ok_or_else(|| anyhow!("в docx нет [Content_Types].xml"))?)?;
+        let types = Types::parse(
+            pkg.get("[Content_Types].xml").ok_or_else(|| anyhow!("в файле нет [Content_Types].xml — это не документ Word или файл повреждён"))?,
+        )
+        .map_err(|e| part_err("[Content_Types].xml", e))?;
         let root_rels = match pkg.get("_rels/.rels") {
-            Some(b) => Rels::parse(b)?,
+            Some(b) => Rels::parse(b).map_err(|e| part_err("_rels/.rels", e))?,
             None => Rels::default(),
         };
         let main = root_rels
@@ -1148,18 +1331,18 @@ impl Src {
             .filter(|r| !r.external && rel_suffix(&r.ty) == "officeDocument")
             .find_map(|r| resolve_part(&pkg, "", &r.target))
             .or_else(|| pkg.name_of("word/document.xml"))
-            .ok_or_else(|| anyhow!("в docx нет основной части документа (word/document.xml)"))?;
+            .ok_or_else(|| anyhow!("в файле нет основной части документа (word/document.xml) — это не документ Word или файл повреждён"))?;
         let rels = match pkg.get(&rels_path(&main)) {
-            Some(b) => Rels::parse(b)?,
+            Some(b) => Rels::parse(b).map_err(|e| part_err(&rels_path(&main), e))?,
             None => Rels::default(),
         };
-        let mut doc = xml::parse(pkg.get(&main).unwrap_or_default()).with_context(|| format!("{main} — {name}"))?;
-        harmonize(&mut doc).with_context(|| format!("{main} — {name}"))?;
+        let mut doc = xml::parse(pkg.get(&main).unwrap_or_default()).map_err(|e| part_err(&main, e))?;
+        harmonize(&mut doc).map_err(|e| part_err(&main, e))?;
         if doc.root.name != "w:document" {
-            bail!("{name} — не документ Word");
+            bail!("это не документ Word (основная часть «{main}» не содержит w:document)");
         }
         if doc.root.child("w:body").is_none() {
-            bail!("в документе {name} нет <w:body>");
+            bail!("в документе нет <w:body>");
         }
         Ok(Src { pkg, name, main, types, rels, doc })
     }
@@ -1176,8 +1359,8 @@ impl Src {
     }
 
     fn load_xml(&self, path: &str) -> Result<xml::Doc> {
-        let mut d = xml::parse(self.pkg.get(path).unwrap_or_default()).with_context(|| format!("{path} — {}", self.name))?;
-        harmonize(&mut d).with_context(|| format!("{path} — {}", self.name))?;
+        let mut d = xml::parse(self.pkg.get(path).unwrap_or_default()).map_err(|e| part_err(path, e))?;
+        harmonize(&mut d).map_err(|e| part_err(path, e))?;
         Ok(d)
     }
 }
@@ -1204,6 +1387,30 @@ struct Ctx {
     para_map: HashMap<String, String>,
     durable_map: HashMap<String, String>,
     bm_rename: HashMap<String, String>,
+    /// Переименованные стили: прежнее имя (строчными) -> новое имя (для полей STYLEREF).
+    style_names: HashMap<String, String>,
+    /// Порядковый номер документа в результате (2 — второй): для имён вида «Заголовок 1 (2)».
+    ordinal: usize,
+    /// Стиль абзаца, который получают абзацы без `pStyle` (в стилях результата).
+    default_target: Option<String>,
+    /// Стиль таблицы по умолчанию, который нужно указать таблицам без `tblStyle`.
+    inject_tblstyle: Option<String>,
+    /// Цепочки стилей результата (для проверки нумерации, заданной стилем).
+    style_info: HashMap<String, StyleLite>,
+    /// Номер списка результата -> новый номер списка этого документа (с началом с 1); `None` — не нужен.
+    restart: HashMap<u64, Option<u64>>,
+    next_num: u64,
+    /// У документа включены разные колонтитулы чётных и нечётных страниц.
+    src_even: bool,
+    /// Копия «обычного» стиля для абзацев внутри таблиц (см. `merge_styles`) и идентификатор исходного.
+    cell_target: Option<String>,
+    src_default_id: Option<String>,
+    /// Тема документа отличается от темы результата, и документ ею пользуется.
+    theme_diff: bool,
+    /// Тема документа, если её цвета и шрифты нужно заменить явными значениями.
+    theme: Option<Theme>,
+    /// Сколько полей оглавления/указателей найдено в документе.
+    toc: usize,
     ranges: HashMap<(&'static str, String), String>,
     vml_map: HashMap<String, String>,
     rel_memo: HashMap<(String, String), String>,
@@ -1213,6 +1420,15 @@ struct Ctx {
     dropped_bindings: usize,
     dropped_refs: usize,
     k: usize,
+}
+
+/// Что стиль говорит о нумерации и отступах абзаца.
+#[derive(Clone, Debug, Default)]
+struct StyleLite {
+    based: Option<String>,
+    num: Option<u64>,
+    ilvl: Option<String>,
+    ind: Option<Vec<(String, String)>>,
 }
 
 struct Mode {
@@ -1236,6 +1452,17 @@ struct Merger {
     hf_state: HashSet<(bool, String)>,
     warnings: Vec<String>,
     touched: bool,
+    /// Сохранять оформление каждого документа (см. `Options`).
+    keep: bool,
+    /// Сколько документов уже добавлено.
+    appended: usize,
+    /// Хотя бы у одного из документов включены разные колонтитулы чётных и нечётных страниц:
+    /// настройка действует на весь файл, поэтому остальным документам колонтитулы копируются на чётные страницы.
+    any_even: bool,
+    /// Копии стилей под новыми именами: (тип, прежнее имя строчными) -> id копий.
+    variants: HashMap<(String, String), Vec<String>>,
+    /// docDefaults, с которыми стиль был добавлен в результат (для стилей, добавленных из других документов).
+    style_dsig: HashMap<String, String>,
 }
 
 const HF_TYPES: [&str; 3] = ["default", "first", "even"];
@@ -1278,6 +1505,32 @@ fn sect_refs(s: &Elem) -> Vec<(bool, String)> {
         .filter(|e| e.name == "w:headerReference" || e.name == "w:footerReference")
         .map(|e| (e.name == "w:footerReference", e.attr("w:type").unwrap_or("default").to_string()))
         .collect()
+}
+
+/// Для колонтитулов «по умолчанию» раздела, у которых нет колонтитула чётных страниц, добавляет ссылку
+/// на тот же колонтитул. Возвращает true, если что-то добавлено.
+fn add_even_refs(s: &mut Elem) -> bool {
+    let mut add = vec![];
+    for tag in ["w:headerReference", "w:footerReference"] {
+        let has = |ty: &str| s.elems().find(|e| e.name == tag && e.attr("w:type").unwrap_or("default") == ty);
+        if let (Some(d), None) = (has("default"), has("even")) {
+            if let Some(rid) = d.attr("r:id") {
+                add.push(Elem::new(tag).with("w:type", "even").with("r:id", rid));
+            }
+        }
+    }
+    if add.is_empty() {
+        return false;
+    }
+    let at = s
+        .children
+        .iter()
+        .rposition(|n| matches!(n, Node::Elem(e) if e.name == "w:headerReference" || e.name == "w:footerReference"))
+        .map_or(0, |i| i + 1);
+    for (k, a) in add.into_iter().enumerate() {
+        s.children.insert(at + k, Node::Elem(a));
+    }
+    true
 }
 
 /// LibreOffice иногда пишет `sectPr` в начало `pPr`; по схеме он идёт после `rPr`, перед `pPrChange`.
@@ -1364,6 +1617,137 @@ fn instr_rename(s: &str, map: &HashMap<String, String>) -> String {
     out
 }
 
+/// `STYLEREF "Имя стиля"`: имя стиля заменяется новым, если стиль был переименован.
+fn styleref_rename(s: &str, names: &HashMap<String, String>) -> String {
+    let t = s.trim_start();
+    let lead = &s[..s.len() - t.len()];
+    let Some(head) = t.get(..8).filter(|h| h.eq_ignore_ascii_case("STYLEREF")) else { return s.to_string() };
+    let rest = &t[8..];
+    let body = rest.trim_start();
+    let gap = &rest[..rest.len() - body.len()];
+    let (name, tail) = match body.strip_prefix('"') {
+        Some(b) => match b.find('"') {
+            Some(i) => (&b[..i], &b[i + 1..]),
+            None => return s.to_string(),
+        },
+        None => {
+            let i = body.find(char::is_whitespace).unwrap_or(body.len());
+            (&body[..i], &body[i..])
+        }
+    };
+    match names.get(&name.to_lowercase()) {
+        Some(n) => format!("{lead}{head}{gap}\"{n}\"{tail}"),
+        None => s.to_string(),
+    }
+}
+
+/// Инструкция поля целиком: закладки и стили, на которые она ссылается, получают новые имена.
+fn rename_instr(s: &str, bm: &HashMap<String, String>, styles: &HashMap<String, String>) -> String {
+    let mut r = if bm.is_empty() { s.to_string() } else { instr_rename(s, bm) };
+    if !styles.is_empty() {
+        r = styleref_rename(&r, styles);
+    }
+    r
+}
+
+/// Поле, которое нужно обновить после слияния (содержимое зависит от нумерации страниц).
+fn is_toc_instr(s: &str) -> bool {
+    let w = s.trim_start().split(|c: char| c.is_whitespace() || c == '\\').next().unwrap_or("");
+    ["TOC", "TOA", "INDEX"].iter().any(|k| w.eq_ignore_ascii_case(k))
+}
+
+/// Переименовывает закладки и стили в инструкциях полей. Word разбивает инструкцию на несколько
+/// `w:instrText` (на границах правок), поэтому для каждой сложной области (`fldChar begin … separate`)
+/// фрагменты склеиваются, результат записывается в первый из них, остальные удаляются.
+/// Возвращает число найденных полей оглавления/указателей.
+fn rename_field_instrs(root: &mut Elem, bm: &HashMap<String, String>, styles: &HashMap<String, String>) -> usize {
+    struct Field {
+        idx: Vec<usize>,
+        text: String,
+        in_instr: bool,
+    }
+    let mut count = 0usize;
+    let mut texts: Vec<String> = vec![];
+    let mut groups: Vec<Vec<usize>> = vec![];
+    let mut stack: Vec<Field> = vec![];
+    let mut toc = 0usize;
+    let finish = |f: Field, groups: &mut Vec<Vec<usize>>, toc: &mut usize| {
+        if is_toc_instr(&f.text) {
+            *toc += 1;
+        }
+        groups.push(f.idx);
+    };
+    xml::walk_ref(root, &mut |e| match e.name.as_str() {
+        "w:fldChar" => match e.attr("w:fldCharType") {
+            Some("begin") => stack.push(Field { idx: vec![], text: String::new(), in_instr: true }),
+            Some("separate") => {
+                if let Some(f) = stack.last_mut() {
+                    f.in_instr = false;
+                }
+            }
+            Some("end") => {
+                if let Some(f) = stack.pop() {
+                    finish(f, &mut groups, &mut toc);
+                }
+            }
+            _ => {}
+        },
+        "w:instrText" => {
+            let t = e.text();
+            texts.push(t.clone());
+            if let Some(f) = stack.last_mut().filter(|f| f.in_instr) {
+                f.idx.push(count);
+                f.text.push_str(&t);
+            } else {
+                groups.push(vec![count]);
+            }
+            count += 1;
+        }
+        "w:fldSimple" if e.attr("w:instr").is_some_and(is_toc_instr) => toc += 1,
+        _ => {}
+    });
+    // Незакрытые поля тоже обрабатываются.
+    while let Some(f) = stack.pop() {
+        finish(f, &mut groups, &mut toc);
+    }
+    // План: индекс фрагмента -> Some(новый текст) | None (удалить).
+    let mut plan: HashMap<usize, Option<String>> = HashMap::new();
+    for g in &groups {
+        if g.is_empty() {
+            continue;
+        }
+        let joined: String = g.iter().map(|&i| texts[i].as_str()).collect();
+        let renamed = rename_instr(&joined, bm, styles);
+        if renamed != joined {
+            plan.insert(g[0], Some(renamed));
+            for &i in &g[1..] {
+                plan.insert(i, None);
+            }
+        }
+    }
+    if !plan.is_empty() {
+        let mut i = 0usize;
+        xml::walk(root, &mut |e| {
+            if e.name == "w:instrText" {
+                let k = i;
+                i += 1;
+                match plan.get(&k) {
+                    Some(Some(t)) => {
+                        e.set_text(t);
+                        if t.starts_with(char::is_whitespace) || t.ends_with(char::is_whitespace) {
+                            e.set_attr("xml:space", "preserve");
+                        }
+                    }
+                    Some(None) => return false,
+                    None => {}
+                }
+            }
+            true
+        });
+    }
+    toc
+}
+
 /// Каноническая запись элемента для сравнения определений (без rsid и служебных атрибутов).
 fn canon_xml(e: &Elem, skip: &[&str], out: &mut String) {
     out.push('<');
@@ -1371,7 +1755,7 @@ fn canon_xml(e: &Elem, skip: &[&str], out: &mut String) {
     let mut attrs: Vec<&(String, String)> =
         e.attrs
             .iter()
-            .filter(|(k, _)| !k.starts_with("w:rsid") && !k.starts_with("w14:") && !k.starts_with("xmlns") && k != "w:styleId" && k != "w:default")
+            .filter(|(k, _)| !k.starts_with("w:rsid") && !k.starts_with("w14:") && !k.starts_with("xmlns") && k != "w:styleId" && k != "w:default" && k != "w:customStyle" && k != "w:abstractNumId")
             .collect();
     attrs.sort();
     for (k, v) in attrs {
@@ -1399,20 +1783,700 @@ const STYLE_SKIP: &[&str] = &[
     "w:personal", "w:personalCompose", "w:personalReply", "w:autoRedefine", "w:link", "w:next", "w:basedOn",
 ];
 
-fn style_sig(st: &Elem, names: &HashMap<String, String>) -> String {
-    let mut s = String::new();
-    if let Some(b) = st.child("w:basedOn").and_then(|b| b.val()) {
-        s.push_str(&format!("basedOn={};", names.get(b).cloned().unwrap_or_else(|| b.to_lowercase())));
-    }
-    canon_xml(st, STYLE_SKIP, &mut s);
-    s
-}
-
 fn truncate_chars(s: &str, n: usize) -> &str {
     match s.char_indices().nth(n) {
         Some((i, _)) => &s[..i],
         None => s,
     }
+}
+
+// ───────────────────────────── Стили ─────────────────────────────
+
+const PPR_ORDER: &[&str] = &[
+    "w:pStyle", "w:keepNext", "w:keepLines", "w:pageBreakBefore", "w:framePr", "w:widowControl", "w:numPr",
+    "w:suppressLineNumbers", "w:pBdr", "w:shd", "w:tabs", "w:suppressAutoHyphens", "w:kinsoku", "w:wordWrap",
+    "w:overflowPunct", "w:topLinePunct", "w:autoSpaceDE", "w:autoSpaceDN", "w:bidi", "w:adjustRightInd",
+    "w:snapToGrid", "w:spacing", "w:ind", "w:contextualSpacing", "w:mirrorIndents", "w:suppressOverlap", "w:jc",
+    "w:textDirection", "w:textAlignment", "w:textboxTightWrap", "w:outlineLvl", "w:divId", "w:cnfStyle", "w:rPr",
+    "w:sectPr", "w:pPrChange",
+];
+
+const RPR_ORDER: &[&str] = &[
+    "w:ins", "w:del", "w:moveFrom", "w:moveTo", "w:rStyle", "w:rFonts", "w:b", "w:bCs", "w:i", "w:iCs", "w:caps",
+    "w:smallCaps", "w:strike", "w:dstrike", "w:outline", "w:shadow", "w:emboss", "w:imprint", "w:noProof",
+    "w:snapToGrid", "w:vanish", "w:webHidden", "w:color", "w:spacing", "w:w", "w:kern", "w:position", "w:sz",
+    "w:szCs", "w:highlight", "w:u", "w:effect", "w:bdr", "w:shd", "w:fitText", "w:vertAlign", "w:rtl", "w:cs",
+    "w:em", "w:lang", "w:eastAsianLayout", "w:specVanish", "w:oMath", "w:rPrChange",
+];
+
+const STYLE_ORDER: &[&str] = &[
+    "w:name", "w:aliases", "w:basedOn", "w:next", "w:link", "w:autoRedefine", "w:hidden", "w:uiPriority",
+    "w:semiHidden", "w:unhideWhenUsed", "w:qFormat", "w:locked", "w:personal", "w:personalCompose",
+    "w:personalReply", "w:rsid", "w:pPr", "w:rPr", "w:tblPr", "w:trPr", "w:tcPr", "w:tblStylePr",
+];
+
+/// Вставляет дочерний элемент на место, предусмотренное схемой (`order` — порядок имён).
+fn insert_ordered(parent: &mut Elem, child: Elem, order: &[&str]) {
+    let rank = |n: &str| order.iter().position(|x| *x == n);
+    let Some(r) = rank(&child.name) else {
+        parent.push(child);
+        return;
+    };
+    let pos = parent
+        .children
+        .iter()
+        .position(|n| matches!(n, Node::Elem(e) if rank(&e.name).is_some_and(|x| x > r)))
+        .unwrap_or(parent.children.len());
+    parent.children.insert(pos, Node::Elem(child));
+}
+
+fn flag_on(e: &Elem, name: &str) -> bool {
+    matches!(e.attr(name), Some("1" | "true" | "on"))
+}
+
+/// Подпись нумераций документа: номер списка -> описание уровней без идентификаторов.
+fn num_sigs(root: &Elem) -> HashMap<String, String> {
+    const SKIP: &[&str] = &["w:nsid", "w:tmpl", "w:name", "w:pStyle", "w:styleLink", "w:numStyleLink"];
+    let mut abs: HashMap<String, String> = HashMap::new();
+    for e in root.elems().filter(|e| e.name == "w:abstractNum") {
+        if let Some(id) = e.attr("w:abstractNumId") {
+            let mut s = String::new();
+            canon_xml(e, SKIP, &mut s);
+            abs.insert(id.to_string(), s);
+        }
+    }
+    let mut out = HashMap::new();
+    for e in root.elems().filter(|e| e.name == "w:num") {
+        let (Some(id), Some(a)) = (e.attr("w:numId"), e.child("w:abstractNumId").and_then(|a| a.val())) else { continue };
+        let mut s = abs.get(a).cloned().unwrap_or_default();
+        for o in e.elems().filter(|o| o.name == "w:lvlOverride") {
+            s.push('|');
+            canon_xml(o, SKIP, &mut s);
+        }
+        out.insert(id.trim().to_string(), s);
+    }
+    out
+}
+
+/// Собственное определение стиля (без родителя), номера списков заменены описанием списка.
+fn style_own_sig(st: &Elem, nums: &HashMap<String, String>) -> String {
+    let mut c = st.clone();
+    xml::walk(&mut c, &mut |e| {
+        if e.name == "w:numId" {
+            if let Some(v) = e.val().map(|v| v.trim().to_string()) {
+                let n = if v == "0" { v } else { format!("num:{}", nums.get(&v).map(String::as_str).unwrap_or("")) };
+                e.set_attr("w:val", n);
+            }
+        }
+        true
+    });
+    let mut s = String::new();
+    canon_xml(&c, STYLE_SKIP, &mut s);
+    s
+}
+
+// Нейтральные значения свойств «по умолчанию» (когда документ их не задаёт).
+fn neutral_attr(elem: &str, attr: &str) -> Option<&'static str> {
+    match (elem, attr) {
+        ("w:spacing", "w:before" | "w:after" | "w:beforeLines" | "w:afterLines" | "w:val") => Some("0"),
+        ("w:spacing", "w:line") => Some("240"),
+        ("w:spacing", "w:lineRule") => Some("auto"),
+        ("w:spacing", "w:beforeAutospacing" | "w:afterAutospacing") => Some("0"),
+        ("w:ind", "w:left" | "w:right" | "w:start" | "w:end" | "w:firstLine" | "w:hanging") => Some("0"),
+        ("w:ind", "w:leftChars" | "w:rightChars" | "w:firstLineChars" | "w:hangingChars") => Some("0"),
+        _ => None,
+    }
+}
+
+/// Элемент «выключено / по умолчанию» для свойства, которое задано в docDefaults первого документа.
+fn neutral_elem(b: &Elem, is_rpr: bool) -> Option<Elem> {
+    let n = b.name.as_str();
+    let toggle_off = |e: &Elem| flag_on(e, "w:val") || e.attr("w:val").is_none();
+    let off = || Elem::new(n).with("w:val", "0");
+    if is_rpr {
+        match n {
+            "w:b" | "w:bCs" | "w:i" | "w:iCs" | "w:caps" | "w:smallCaps" | "w:strike" | "w:dstrike" | "w:vanish"
+            | "w:shadow" | "w:emboss" | "w:imprint" | "w:outline"
+                if toggle_off(b) =>
+            {
+                Some(off())
+            }
+            "w:sz" | "w:szCs" => Some(Elem::new(n).with("w:val", "20")),
+            "w:color" => Some(Elem::new(n).with("w:val", "auto")),
+            "w:kern" | "w:position" | "w:spacing" => Some(Elem::new(n).with("w:val", "0")),
+            "w:w" => Some(Elem::new(n).with("w:val", "100")),
+            _ => None,
+        }
+    } else {
+        match n {
+            "w:spacing" | "w:ind" => {
+                let mut e = Elem::new(n);
+                for (k, _) in &b.attrs {
+                    if let Some(v) = neutral_attr(n, k) {
+                        e.set_attr(k, v);
+                    }
+                }
+                (!e.attrs.is_empty()).then_some(e)
+            }
+            "w:jc" => Some(Elem::new(n).with("w:val", "left")),
+            "w:keepNext" | "w:keepLines" | "w:pageBreakBefore" | "w:suppressAutoHyphens" | "w:contextualSpacing" | "w:bidi"
+            | "w:mirrorIndents"
+                if toggle_off(b) =>
+            {
+                Some(off())
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Свойство `c` из docDefaults документа-источника переносится в определение стиля `t`.
+fn absorb_default(t: &mut Elem, c: &Elem, order: &[&str]) {
+    let Some(i) = t.children.iter().position(|n| matches!(n, Node::Elem(e) if e.name == c.name)) else {
+        insert_ordered(t, c.clone(), order);
+        return;
+    };
+    let Node::Elem(te) = &mut t.children[i] else { return };
+    if c.name == "w:rFonts" {
+        // Каждая «группа» (обычный шрифт / шрифт темы) наследуется целиком.
+        for group in [["w:ascii", "w:asciiTheme"], ["w:hAnsi", "w:hAnsiTheme"], ["w:eastAsia", "w:eastAsiaTheme"], ["w:cs", "w:cstheme"]] {
+            if group.iter().all(|g| te.attr(g).is_none()) {
+                for g in group {
+                    if let Some(v) = c.attr(g) {
+                        te.set_attr(g, v);
+                    }
+                }
+            }
+        }
+    } else if matches!(c.name.as_str(), "w:spacing" | "w:ind" | "w:lang") {
+        for (k, v) in &c.attrs {
+            if te.attr(k).is_none() {
+                te.set_attr(k, v.clone());
+            }
+        }
+    }
+}
+
+/// Свойство `b` задано в docDefaults первого документа, а у источника его нет: чтобы оно не «просочилось»,
+/// в определении стиля задаётся нейтральное значение.
+fn neutralize_default(t: &mut Elem, b: &Elem, order: &[&str], is_rpr: bool) {
+    match t.children.iter().position(|n| matches!(n, Node::Elem(e) if e.name == b.name)) {
+        None => {
+            if let Some(n) = neutral_elem(b, is_rpr) {
+                insert_ordered(t, n, order);
+            }
+        }
+        Some(i) => {
+            let Node::Elem(te) = &mut t.children[i] else { return };
+            if matches!(b.name.as_str(), "w:spacing" | "w:ind") {
+                for (k, _) in &b.attrs {
+                    if te.attr(k).is_none() {
+                        if let Some(v) = neutral_attr(&b.name, k) {
+                            te.set_attr(k, v);
+                        }
+                    }
+                }
+            } else if b.name == "w:rFonts" {
+                for (g, th) in [("w:ascii", "w:asciiTheme"), ("w:hAnsi", "w:hAnsiTheme")] {
+                    if (b.attr(g).is_some() || b.attr(th).is_some()) && te.attr(g).is_none() && te.attr(th).is_none() {
+                        te.set_attr(g, "Times New Roman");
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Переносит в корневой стиль абзаца (без `basedOn`) свойства docDefaults документа-источника: после
+/// слияния действуют docDefaults первого документа, и текст без явного оформления иначе изменил бы вид.
+fn push_defaults(st: &mut Elem, ds: Option<&Elem>, db: Option<&Elem>, skip: Option<&PprSkip>) {
+    for (cont, prop, order, is_rpr) in [("w:pPrDefault", "w:pPr", PPR_ORDER, false), ("w:rPrDefault", "w:rPr", RPR_ORDER, true)] {
+        let skip = skip.filter(|_| !is_rpr);
+        let sp = ds.and_then(|d| d.child(cont)).and_then(|c| c.child(prop));
+        let bp = db.and_then(|d| d.child(cont)).and_then(|c| c.child(prop));
+        if sp.is_none() && bp.is_none() {
+            continue;
+        }
+        if st.child(prop).is_none() {
+            insert_ordered(st, Elem::new(prop), STYLE_ORDER);
+        }
+        let Some(t) = st.child_mut(prop) else { continue };
+        if let Some(sp) = sp {
+            for c in sp.elems() {
+                if let Some(c) = without_skipped(c, skip) {
+                    absorb_default(t, &c, order);
+                }
+            }
+        }
+        if let Some(bp) = bp {
+            for c in bp.elems() {
+                if let Some(c) = without_skipped(c, skip) {
+                    neutralize_default(t, &c, order, is_rpr);
+                }
+            }
+        }
+    }
+}
+
+/// Свойства абзаца (имя элемента -> атрибуты), которые задают стили таблиц: у абзацев в ячейках таблицы
+/// они сильнее docDefaults, но слабее явных свойств стиля абзаца.
+type PprSkip = HashMap<String, HashSet<String>>;
+
+fn without_skipped(c: &Elem, skip: Option<&PprSkip>) -> Option<Elem> {
+    let Some(set) = skip.and_then(|s| s.get(&c.name)) else { return Some(c.clone()) };
+    if !matches!(c.name.as_str(), "w:spacing" | "w:ind") {
+        return None;
+    }
+    let mut c = c.clone();
+    c.attrs.retain(|(k, _)| !set.contains(k));
+    (!c.attrs.is_empty()).then_some(c)
+}
+
+/// Что задают в свойствах абзаца стили таблиц `tables` (включая условное оформление строк и столбцов).
+fn table_ppr_props(tables: &[&Elem]) -> PprSkip {
+    let mut out: PprSkip = HashMap::new();
+    for st in tables {
+        let pprs = st.child("w:pPr").into_iter().chain(st.elems().filter(|e| e.name == "w:tblStylePr").filter_map(|e| e.child("w:pPr")));
+        for ppr in pprs {
+            for c in ppr.elems() {
+                let e = out.entry(c.name.clone()).or_default();
+                if matches!(c.name.as_str(), "w:spacing" | "w:ind") {
+                    e.extend(c.attrs.iter().map(|(k, _)| k.clone()));
+                } else {
+                    e.insert("*".into());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Помечает абзацы внутри ячеек таблиц временным атрибутом `mf:cell` (его снимает `xform_elem`).
+fn mark_cell_paragraphs(e: &mut Elem, in_cell: bool) {
+    for n in e.children.iter_mut() {
+        if let Node::Elem(c) = n {
+            let inside = in_cell || c.name == "w:tc";
+            if inside && c.name == "w:p" {
+                c.set_attr("mf:cell", "1");
+            }
+            mark_cell_paragraphs(c, inside);
+        }
+    }
+}
+
+/// Какие стили используются в содержимом документа (основная часть, колонтитулы, сноски, примечания,
+/// нумерация) и есть ли в нём таблицы.
+fn used_styles(src: &Src) -> (HashSet<String>, bool) {
+    let mut used = HashSet::new();
+    let mut tables = false;
+    let mut scan = |root: &Elem| {
+        xml::walk_ref(root, &mut |e| match e.name.as_str() {
+            "w:pStyle" | "w:rStyle" | "w:tblStyle" | "w:numStyleLink" | "w:styleLink" => {
+                if let Some(v) = e.val() {
+                    used.insert(v.to_string());
+                }
+            }
+            "w:tbl" => tables = true,
+            _ => {}
+        });
+    };
+    scan(&src.doc.root);
+    let mut parts = vec![];
+    for r in src.rels.items.iter().filter(|r| !r.external) {
+        if matches!(rel_suffix(&r.ty), "header" | "footer" | "footnotes" | "endnotes" | "comments" | "numbering") {
+            if let Some(p) = resolve_part(&src.pkg, &src.main, &r.target) {
+                parts.push(p);
+            }
+        }
+    }
+    parts.sort();
+    parts.dedup();
+    for p in parts {
+        if let Some(d) = src.pkg.get(&p).and_then(|b| xml::parse(b).ok()) {
+            scan(&d.root);
+        }
+    }
+    (used, tables)
+}
+
+struct SRec<'a> {
+    el: &'a Elem,
+    id: String,
+    ty: String,
+    name: String,
+    name_l: String,
+    default: bool,
+    based: Option<usize>,
+    link: Option<usize>,
+}
+
+struct BRec {
+    id: String,
+    ty: String,
+    default: bool,
+    based: Option<String>,
+    sig: String,
+    named_sig: String,
+    dsig: String,
+}
+
+#[derive(Clone, Debug)]
+enum Dec {
+    /// Использовать стиль базы с таким id.
+    Merge(String),
+    /// Добавить стиль в базу: новый id и (если стиль переименован) новое имя.
+    Import { id: String, name: Option<String> },
+    /// Стиль нигде не используется — не переносится.
+    Skip,
+}
+
+impl Dec {
+    fn target(&self) -> Option<&str> {
+        match self {
+            Dec::Merge(id) | Dec::Import { id, .. } => Some(id),
+            Dec::Skip => None,
+        }
+    }
+}
+
+/// Решает судьбу каждого стиля документа-источника.
+struct Planner<'a> {
+    keep: bool,
+    def_para: Option<usize>,
+    src: Vec<SRec<'a>>,
+    base: Vec<BRec>,
+    by_key: HashMap<(String, String), Vec<usize>>,
+    base_default: HashMap<String, usize>,
+    needed: HashSet<usize>,
+    forced: HashSet<usize>,
+    dsig: String,
+    sigs: Vec<String>,
+    named_sigs: Vec<String>,
+    decs: Vec<Option<Dec>>,
+    busy: Vec<bool>,
+    base_ids: HashSet<String>,
+    base_names: HashSet<String>,
+    src_ids: HashSet<String>,
+    src_names: HashSet<String>,
+    taken_ids: HashSet<String>,
+    taken_names: HashSet<String>,
+    ordinal: usize,
+    conflicts: Vec<String>,
+}
+
+impl<'a> Planner<'a> {
+    fn equiv(&self, i: usize, c: usize, parent: &Option<String>) -> bool {
+        let b = &self.base[c];
+        b.ty == self.src[i].ty && b.dsig == self.dsig && b.sig == self.sigs[i] && b.based == *parent && !self.forced.contains(&i)
+    }
+
+    /// Свободный идентификатор стиля. Новый идентификатор не должен совпадать с идентификатором другого стиля
+    /// источника: ссылки источника переписываются по карте «старый -> новый» ровно один раз, и новое значение
+    /// не должно быть принято за старое (у источника, который сам был результатом слияния, бывают id вида `_m1`).
+    fn unique_id(&mut self, id: &str) -> String {
+        let mut new = id.to_string();
+        let mut k = 1;
+        loop {
+            let l = new.to_lowercase();
+            let other_src = self.src_ids.contains(&l) && new != id;
+            if !self.taken_ids.contains(&l) && !other_src {
+                break;
+            }
+            new = format!("{id}_m{k}");
+            k += 1;
+        }
+        self.taken_ids.insert(new.to_lowercase());
+        new
+    }
+
+    /// То же для стиля, которого нет в источнике (созданного для результата).
+    fn unique_new_id(&mut self, id: &str) -> String {
+        let mut new = id.to_string();
+        let mut k = 1;
+        while self.taken_ids.contains(&new.to_lowercase()) || self.src_ids.contains(&new.to_lowercase()) {
+            new = format!("{id}_m{k}");
+            k += 1;
+        }
+        self.taken_ids.insert(new.to_lowercase());
+        new
+    }
+
+    fn fresh_name(&mut self, name: &str) -> String {
+        let base = truncate_chars(name, 200).to_string();
+        let mut k = self.ordinal.max(2);
+        loop {
+            let cand = format!("{base} ({k})");
+            k += 1;
+            // Имя не должно совпасть и с именем другого стиля источника (он переносится под своим именем).
+            if !self.src_names.contains(&cand.to_lowercase()) && self.taken_names.insert(cand.to_lowercase()) {
+                return cand;
+            }
+        }
+    }
+
+    fn decide(&mut self, i: usize) {
+        if self.decs[i].is_some() || self.busy[i] {
+            return;
+        }
+        self.busy[i] = true;
+        let parent = self.src[i].based.and_then(|p| {
+            self.decide(p);
+            self.decs[p].as_ref().and_then(|d| d.target().map(String::from))
+        });
+        let key = (self.src[i].ty.clone(), self.src[i].name_l.clone());
+        let mut cands: Vec<usize> = self.by_key.get(&key).cloned().unwrap_or_default();
+        let same_name = !cands.is_empty();
+        if !same_name && self.src[i].default {
+            cands.extend(self.base_default.get(&key.0).copied());
+        }
+        let dec = if self.keep {
+            if let Some(&c) = cands.iter().find(|&&c| self.equiv(i, c, &parent)) {
+                Dec::Merge(self.base[c].id.clone())
+            } else if !same_name && !self.taken_names.contains(&self.src[i].name_l) {
+                let id = self.unique_id(&self.src[i].id.clone());
+                self.taken_names.insert(self.src[i].name_l.clone());
+                Dec::Import { id, name: None }
+            } else if self.needed.contains(&i) || self.forced.contains(&i) || !same_name {
+                // Имя занято (стилем другого типа или копией) — стиль переносится под новым именем.
+                let id = self.unique_id(&self.src[i].id.clone());
+                let name = self.fresh_name(&self.src[i].name.clone());
+                Dec::Import { id, name: Some(name) }
+            } else {
+                Dec::Skip
+            }
+        } else if let Some(&c) = cands.first() {
+            // Побеждает стиль первого документа.
+            if self.base[c].named_sig != self.named_sigs[i] {
+                self.conflicts.push(self.src[i].name.clone());
+            }
+            Dec::Merge(self.base[c].id.clone())
+        } else {
+            let id = self.unique_id(&self.src[i].id.clone());
+            Dec::Import { id, name: None }
+        };
+        self.decs[i] = Some(dec);
+        self.busy[i] = false;
+    }
+
+    fn run(&mut self) {
+        loop {
+            for i in 0..self.src.len() {
+                self.decide(i);
+            }
+            if !self.keep {
+                return;
+            }
+            // Связанные стили (абзаца и знака) переносятся парой: если один добавлен под новым именем,
+            // второй тоже, иначе ссылка `link` указывала бы на стиль с другим оформлением.
+            let mut grew = false;
+            for i in 0..self.src.len() {
+                let Some(j) = self.src[i].link else { continue };
+                let renamed = |d: &Option<Dec>| matches!(d, Some(Dec::Import { name: Some(_), .. }));
+                if renamed(&self.decs[j]) && matches!(self.decs[i], Some(Dec::Merge(_))) && self.forced.insert(i) {
+                    grew = true;
+                }
+            }
+            if !grew {
+                return;
+            }
+            // Повторяем с нуля: решения о родителях и детях могли измениться.
+            for d in self.decs.iter_mut() {
+                *d = None;
+            }
+            self.taken_ids = self.base_ids.clone();
+            self.taken_names = self.base_names.clone();
+        }
+    }
+}
+
+/// Шрифты и цвета темы оформления документа.
+#[derive(Clone, Debug, Default)]
+struct Theme {
+    /// Описание темы для сравнения (без названий).
+    sig: String,
+    /// "majorHAnsi", "minorEastAsia", ... -> название шрифта
+    fonts: HashMap<String, String>,
+    /// "dk1", "lt1", "accent1", ... -> цвет RRGGBB
+    colors: HashMap<String, String>,
+}
+
+fn load_theme(pkg: &Pkg, rels: &Rels, owner: &str) -> Option<Theme> {
+    let p = rels.items.iter().filter(|r| !r.external && rel_suffix(&r.ty) == "theme").find_map(|r| resolve_part(pkg, owner, &r.target))?;
+    let d = xml::parse(pkg.get(&p)?).ok()?;
+    let te = d.root.elems().find(|e| e.local() == "themeElements")?;
+    let mut th = Theme::default();
+    if let Some(fs) = te.elems().find(|e| e.local() == "fontScheme") {
+        for (group, pre) in [("majorFont", "major"), ("minorFont", "minor")] {
+            let Some(g) = fs.elems().find(|e| e.local() == group) else { continue };
+            for (tag, suffix) in [("latin", "HAnsi"), ("ea", "EastAsia"), ("cs", "Bidi")] {
+                if let Some(f) = g.elems().find(|e| e.local() == tag).and_then(|e| e.attr("typeface")) {
+                    th.fonts.insert(format!("{pre}{suffix}"), f.to_string());
+                }
+            }
+        }
+    }
+    if let Some(cs) = te.elems().find(|e| e.local() == "clrScheme") {
+        for c in cs.elems() {
+            let hex = c.elems().next().and_then(|v| v.attr("val").filter(|_| v.local() == "srgbClr").or_else(|| v.attr("lastClr")));
+            if let Some(h) = hex {
+                th.colors.insert(c.local().to_string(), h.to_uppercase());
+            }
+        }
+    }
+    let mut parts: Vec<String> = th.fonts.iter().map(|(k, v)| format!("f:{k}={v}")).chain(th.colors.iter().map(|(k, v)| format!("c:{k}={v}"))).collect();
+    parts.sort();
+    th.sig = parts.join(";");
+    Some(th)
+}
+
+/// Имя цвета темы (Word или DrawingML) -> ключ схемы цветов.
+fn theme_color_key(n: &str) -> &str {
+    match n {
+        "dark1" | "text1" | "tx1" => "dk1",
+        "light1" | "background1" | "bg1" => "lt1",
+        "dark2" | "text2" | "tx2" => "dk2",
+        "light2" | "background2" | "bg2" => "lt2",
+        "hyperlink" => "hlink",
+        "followedHyperlink" => "folHlink",
+        o => o,
+    }
+}
+
+/// Цвета и шрифты темы заменяются явными значениями (когда тема документа отличается от темы результата).
+fn flatten_theme(e: &mut Elem, th: &Theme) {
+    match e.name.as_str() {
+        "w:rFonts" => {
+            for (ta, explicit) in [("w:asciiTheme", "w:ascii"), ("w:hAnsiTheme", "w:hAnsi"), ("w:eastAsiaTheme", "w:eastAsia"), ("w:cstheme", "w:cs")] {
+                if let Some(v) = e.remove_attr(ta) {
+                    if let Some(f) = th.fonts.get(&v).filter(|f| !f.is_empty()) {
+                        e.set_attr(explicit, f.clone());
+                    }
+                }
+            }
+        }
+        "a:schemeClr" => {
+            if let Some(h) = e.attr("val").and_then(|v| th.colors.get(theme_color_key(v))).cloned() {
+                e.name = "a:srgbClr".into();
+                e.set_attr("val", h);
+            }
+        }
+        _ => {
+            let color_target = if e.name == "w:color" { "w:val" } else { "w:color" };
+            for (tc, shade, tint, target) in
+                [("w:themeColor", "w:themeShade", "w:themeTint", color_target), ("w:themeFill", "w:themeFillShade", "w:themeFillTint", "w:fill")]
+            {
+                if let Some(n) = e.remove_attr(tc) {
+                    e.remove_attr(shade);
+                    e.remove_attr(tint);
+                    // Word пишет и вычисленный цвет, и ссылку на тему; тема нужна, только если цвета нет.
+                    if matches!(e.attr(target), None | Some("auto")) {
+                        if let Some(h) = th.colors.get(theme_color_key(&n)) {
+                            e.set_attr(target, h.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Порядок дочерних элементов `w:settings` по схеме.
+const SETTINGS_ORDER: &[&str] = &[
+    "w:writeProtection", "w:view", "w:zoom", "w:removePersonalInformation", "w:removeDateAndTime",
+    "w:doNotDisplayPageBoundaries", "w:displayBackgroundShape", "w:printPostScriptOverText",
+    "w:printFractionalCharacterWidth", "w:printFormsData", "w:embedTrueTypeFonts", "w:embedSystemFonts",
+    "w:saveSubsetFonts", "w:saveFormsData", "w:mirrorMargins", "w:alignBordersAndEdges",
+    "w:bordersDoNotSurroundHeader", "w:bordersDoNotSurroundFooter", "w:gutterAtTop", "w:hideSpellingErrors",
+    "w:hideGrammaticalErrors", "w:activeWritingStyle", "w:proofState", "w:formsDesign", "w:attachedTemplate",
+    "w:linkStyles", "w:stylePaneFormatFilter", "w:stylePaneSortMethod", "w:documentType", "w:mailMerge",
+    "w:revisionView", "w:trackRevisions", "w:doNotTrackMoves", "w:doNotTrackFormatting", "w:documentProtection",
+    "w:autoFormatOverride", "w:styleLockTheme", "w:styleLockQFSet", "w:defaultTabStop", "w:autoHyphenation",
+    "w:consecutiveHyphenLimit", "w:hyphenationZone", "w:doNotHyphenateCaps", "w:showEnvelope", "w:summaryLength",
+    "w:clickAndTypeStyle", "w:defaultTableStyle", "w:evenAndOddHeaders", "w:bookFoldRevPrinting",
+    "w:bookFoldPrinting", "w:bookFoldPrintingSheets", "w:drawingGridHorizontalSpacing",
+    "w:drawingGridVerticalSpacing", "w:displayHorizontalDrawingGridEvery", "w:displayVerticalDrawingGridEvery",
+    "w:doNotUseMarginsForDrawingGridOrigin", "w:drawingGridHorizontalOrigin", "w:drawingGridVerticalOrigin",
+    "w:doNotShadeFormData", "w:noPunctuationKerning", "w:characterSpacingControl", "w:printTwoOnOne",
+    "w:strictFirstAndLastChars", "w:noLineBreaksAfter", "w:noLineBreaksBefore", "w:savePreviewPicture",
+    "w:doNotValidateAgainstSchema", "w:saveInvalidXml", "w:ignoreMixedContent", "w:alwaysShowPlaceholderText",
+    "w:doNotDemarcateInvalidXml", "w:saveXmlDataOnly", "w:useXSLTWhenSaving", "w:saveThroughXslt",
+    "w:showXMLTags", "w:alwaysMergeEmptyNamespace", "w:updateFields", "w:hdrShapeDefaults", "w:footnotePr",
+    "w:endnotePr", "w:compat", "w:docVars", "w:rsids", "m:mathPr", "w:attachedSchema", "w:themeFontLang",
+    "w:clrSchemeMapping", "w:doNotIncludeSubdocsInStats", "w:doNotAutoCompressPictures", "w:forceUpgrade",
+    "w:captions", "w:readModeInkLockDown", "w:smartTagType", "w:schemaLibrary", "w:shapeDefaults",
+    "w:doNotEmbedSmartTags", "w:decimalSymbol", "w:listSeparator",
+];
+
+/// Включена ли настройка `tag` в корне `settings` (элемент есть и не выключен через `w:val`).
+fn setting_on(root: &Elem, tag: &str) -> bool {
+    root.child(tag).is_some_and(|e| !matches!(e.val(), Some("0" | "false" | "off")))
+}
+
+/// Включены ли у документа разные колонтитулы чётных и нечётных страниц — без разбора всего пакета.
+fn peek_even_odd(path: &Path) -> bool {
+    let Ok(f) = std::fs::File::open(path) else { return false };
+    let Ok(mut zip) = zip::ZipArchive::new(f) else { return false };
+    let names: Vec<String> = zip.file_names().filter_map(|n| n.ok().map(|c| c.into_owned())).collect();
+    let mut read = |want: &str| -> Option<Vec<u8>> {
+        let n = names.iter().find(|n| n.trim_start_matches('/').replace('\\', "/").eq_ignore_ascii_case(want))?;
+        let mut buf = vec![];
+        zip.by_name(n).ok()?.read_to_end(&mut buf).ok()?;
+        Some(buf)
+    };
+    let main = read("_rels/.rels")
+        .and_then(|b| Rels::parse(&b).ok())
+        .and_then(|r| {
+            r.items
+                .iter()
+                .find(|x| !x.external && rel_suffix(&x.ty) == "officeDocument")
+                .map(|x| normalize(x.target.trim_start_matches('/')))
+        })
+        .unwrap_or_else(|| "word/document.xml".to_string());
+    let Some(rels) = read(&rels_path(&main)).and_then(|b| Rels::parse(&b).ok()) else { return false };
+    let Some(target) = rels.items.iter().find(|x| !x.external && rel_suffix(&x.ty) == "settings").map(|x| x.target.clone()) else {
+        return false;
+    };
+    let path = match target.strip_prefix('/') {
+        Some(t) => normalize(t),
+        None => normalize(&join(dir_of(&main), &target)),
+    };
+    read(&path).and_then(|b| xml::parse(&b).ok()).is_some_and(|d| setting_on(&d.root, "w:evenAndOddHeaders"))
+}
+
+/// Нумерация, которую абзац получает от своего стиля (с учётом родительских стилей).
+struct ChainNum {
+    num: u64,
+    ilvl: Option<String>,
+    ind: Option<Vec<(String, String)>>,
+    chain: Vec<String>,
+}
+
+fn chain_numbering(info: &HashMap<String, StyleLite>, id: &str) -> Option<ChainNum> {
+    let mut cur = Some(id.to_string());
+    let mut chain: Vec<String> = vec![];
+    let (mut num, mut ilvl): (Option<u64>, Option<String>) = (None, None);
+    let mut ind: Vec<(String, String)> = vec![];
+    while let Some(c) = cur.take() {
+        if chain.len() > 32 || chain.contains(&c) {
+            break;
+        }
+        let Some(s) = info.get(&c) else { break };
+        chain.push(c);
+        if num.is_none() {
+            num = s.num;
+        }
+        if ilvl.is_none() {
+            ilvl = s.ilvl.clone();
+        }
+        for (k, v) in s.ind.iter().flatten() {
+            if !ind.iter().any(|(kk, _)| kk == k) {
+                ind.push((k.clone(), v.clone()));
+            }
+        }
+        cur = s.based.clone();
+    }
+    let n = num.filter(|n| *n != 0)?;
+    Some(ChainNum { num: n, ilvl, ind: (!ind.is_empty()).then_some(ind), chain })
 }
 
 impl Merger {
@@ -1434,6 +2498,11 @@ impl Merger {
             hf_state: HashSet::new(),
             warnings: vec![],
             touched: false,
+            keep: true,
+            appended: 0,
+            any_even: false,
+            variants: HashMap::new(),
+            style_dsig: HashMap::new(),
         };
         m.rels.insert(main, rels);
         // Идентификаторы, уже занятые в основном документе, колонтитулах и примечаниях.
@@ -1507,8 +2576,8 @@ impl Merger {
         let suffix = rel_suffix(kind(key).ty);
         let main = self.main.clone();
         let Some(path) = self.rel_targets(&main, &[suffix]).into_iter().next() else { return Ok(false) };
-        let mut doc = xml::parse(self.pkg.get(&path).unwrap_or_default()).with_context(|| format!("{path} (первый документ)"))?;
-        harmonize(&mut doc).with_context(|| format!("{path} (первый документ)"))?;
+        let mut doc = xml::parse(self.pkg.get(&path).unwrap_or_default()).map_err(|e| part_err(&path, e))?;
+        harmonize(&mut doc).map_err(|e| part_err(&path, e))?;
         self.parts.insert(key, Part { path, doc, dirty: false });
         Ok(true)
     }
@@ -1585,14 +2654,18 @@ impl Merger {
             self.plan_bookmarks(cx, &[&d.root]);
             let saved = std::mem::take(&mut cx.ranges);
             let mode = Mode { rels: None };
+            if cx.cell_target.is_some() {
+                mark_cell_paragraphs(&mut d.root, false);
+            }
             xml::walk(&mut d.root, &mut |e| self.xform_elem(src, cx, &mode, e));
+            cx.toc += rename_field_instrs(&mut d.root, &cx.bm_rename, &cx.style_names);
             cx.ranges = saved;
             bytes = xml::to_bytes(&d);
         } else if suffix == "diagramData" {
             bytes = self.patch_diagram_data(src, cx, &bytes);
         }
         if let Some(rb) = src.pkg.get(&rels_path(src_path)) {
-            let srels = Rels::parse(rb).with_context(|| format!("{} — {}", rels_path(src_path), src.name))?;
+            let srels = Rels::parse(rb).map_err(|e| part_err(&rels_path(src_path), e))?;
             let mut out = Rels::default();
             for r in &srels.items {
                 if r.external {
@@ -1632,7 +2705,8 @@ impl Merger {
 
     /// В данных SmartArt `dsp:dataModelExt relId` ссылается на связь основного документа.
     fn patch_diagram_data(&mut self, src: &Src, cx: &mut Ctx, bytes: &[u8]) -> Vec<u8> {
-        let Ok(s) = std::str::from_utf8(bytes) else { return bytes.to_vec() };
+        let Ok(decoded) = xml::decode(bytes) else { return bytes.to_vec() };
+        let s = decoded.as_str();
         let key = "relId=\"";
         let mut out = String::with_capacity(s.len());
         let mut rest = s;
@@ -1647,6 +2721,13 @@ impl Merger {
             rest = &rest[a + l..];
         }
         out.push_str(rest);
+        let was_utf8 = std::str::from_utf8(bytes.strip_prefix(&[0xEF, 0xBB, 0xBF][..]).unwrap_or(bytes)).is_ok();
+        if !was_utf8 {
+            // Часть была в UTF-16: теперь это UTF-8, объявление кодировки должно совпадать.
+            let head_end = out.char_indices().nth(200).map_or(out.len(), |(i, _)| i);
+            let head = out[..head_end].replace("UTF-16", "UTF-8").replace("utf-16", "UTF-8");
+            out = format!("{head}{}", &out[head_end..]);
+        }
         out.into_bytes()
     }
 
@@ -1775,14 +2856,26 @@ impl Merger {
                 return false;
             }
         }
+        if let Some(th) = &cx.theme {
+            flatten_theme(e, th);
+        }
         let name = e.name.clone();
         match name.as_str() {
-            "w:pStyle" | "w:rStyle" | "w:tblStyle" | "w:numStyleLink" | "w:styleLink" | "w:basedOn" | "w:next" | "w:link" => {
+            "w:pStyle" | "w:rStyle" | "w:tblStyle" | "w:numStyleLink" | "w:styleLink" => {
                 if let Some(n) = e.val().and_then(|v| cx.style_map.get(v)) {
                     let n = n.clone();
                     e.set_attr("w:val", n);
                 }
             }
+            // Родитель, следующий и связанный стили: если стиль не перенесён, ссылка убирается
+            // (иначе она указала бы на другой стиль базы с тем же идентификатором).
+            "w:basedOn" | "w:next" | "w:link" => match e.val().and_then(|v| cx.style_map.get(v)) {
+                Some(n) => {
+                    let n = n.clone();
+                    e.set_attr("w:val", n);
+                }
+                None => return false,
+            },
             "w:numId" => {
                 if let Some(v) = e.val().and_then(|v| v.trim().parse::<u64>().ok()) {
                     if v != 0 {
@@ -1831,24 +2924,39 @@ impl Merger {
             }
             "w:fldSimple" => {
                 if let Some(a) = e.attr("w:instr") {
-                    let n = instr_rename(a, &cx.bm_rename);
+                    let n = rename_instr(a, &cx.bm_rename, &cx.style_names);
                     if n != a {
                         e.set_attr("w:instr", n);
                     }
                 }
             }
-            "w:instrText" => {
-                if !cx.bm_rename.is_empty() {
-                    let t = e.text();
-                    let n = instr_rename(&t, &cx.bm_rename);
-                    if n != t {
-                        e.set_text(&n);
+            "w:pPr" => fix_ppr_order(e),
+            "w:tblPr" => {
+                if let Some(id) = &cx.inject_tblstyle {
+                    if e.child("w:tblStyle").is_none() {
+                        e.children.insert(0, Node::Elem(Elem::new("w:tblStyle").with("w:val", id)));
                     }
                 }
             }
-            "w:pPr" => fix_ppr_order(e),
             "w:p" => {
-                if let Some(id) = &cx.inject_pstyle {
+                self.restart_style_numbering(cx, e);
+                let in_cell = e.remove_attr("mf:cell").is_some();
+                let mut done = false;
+                if let (true, Some(cell)) = (in_cell, cx.cell_target.clone()) {
+                    // В ячейке таблицы «обычный» стиль (явный или неявный) — особая копия.
+                    let cur = e.child("w:pPr").and_then(|p| p.child("w:pStyle")).and_then(|s| s.val()).map(String::from);
+                    if cur.is_none() || cur == cx.src_default_id {
+                        if e.child("w:pPr").is_none() {
+                            e.children.insert(0, Node::Elem(Elem::new("w:pPr")));
+                        }
+                        if let Some(ppr) = e.child_mut("w:pPr") {
+                            ppr.children.retain(|n| !matches!(n, Node::Elem(x) if x.name == "w:pStyle"));
+                            ppr.children.insert(0, Node::Elem(Elem::new("w:pStyle").with("w:val", &cell)));
+                        }
+                        done = true;
+                    }
+                }
+                if let (false, Some(id)) = (done, &cx.inject_pstyle) {
                     let has = e.child("w:pPr").is_some_and(|p| p.child("w:pStyle").is_some());
                     if !has {
                         if e.child("w:pPr").is_none() {
@@ -1933,151 +3041,450 @@ impl Merger {
             root.children.retain(|n| matches!(n, Node::Elem(e) if e.name == "w:docDefaults" || e.name == "w:latentStyles"));
             self.create_part("styles", root);
         }
-        let part = self.parts.get_mut("styles").expect("часть стилей загружена");
-        let broot = &mut part.doc.root;
         let sroot = &sdoc.root;
-
-        fn id_names(root: &Elem) -> HashMap<String, String> {
-            root.elems()
-                .filter(|e| e.name == "w:style")
-                .filter_map(|e| {
-                    let id = e.attr("w:styleId")?;
-                    let n = e.child("w:name").and_then(|n| n.val()).unwrap_or(id);
-                    Some((id.to_string(), n.to_lowercase()))
-                })
-                .collect()
-        }
-        let bnames = id_names(broot);
-        let snames = id_names(sroot);
-        let key_of = |e: &Elem, names: &HashMap<String, String>| {
-            let id = e.attr("w:styleId").unwrap_or("");
-            (e.attr("w:type").unwrap_or("paragraph").to_string(), names.get(id).cloned().unwrap_or_else(|| id.to_lowercase()))
+        let snum = match src.part_path("numbering") {
+            Some(p) => num_sigs(&src.load_xml(&p)?.root),
+            None => HashMap::new(),
         };
-        let mut by_key: HashMap<(String, String), (String, String)> = HashMap::new();
-        let mut base_ids: HashSet<String> = HashSet::new();
-        let mut default_types: HashSet<String> = HashSet::new();
-        // Стили «по умолчанию» базы: тип -> (id, подпись)
-        let mut base_defaults: HashMap<String, (String, String)> = HashMap::new();
-        for e in broot.elems().filter(|e| e.name == "w:style") {
+        let bnum = self.parts.get("numbering").map(|p| num_sigs(&p.doc.root)).unwrap_or_default();
+        let keep = self.keep;
+        let canon_dd = |d: Option<&Elem>| {
+            let mut s = String::new();
+            if let Some(d) = d {
+                canon_xml(d, &[], &mut s);
+            }
+            s
+        };
+        let part = self.parts.get("styles").expect("часть стилей загружена");
+        let broot = &part.doc.root;
+        let (mut sdd, bdd) = (canon_dd(sroot.child("w:docDefaults")), canon_dd(broot.child("w:docDefaults")));
+        if let (true, Some(th)) = (cx.theme_diff, &cx.theme) {
+            // Тема другая: даже одинаковые стили, пользующиеся её шрифтами и цветами, выглядят иначе.
+            sdd.push_str(&format!("|theme:{}", th.sig));
+        }
+        let d_diff = sdd != bdd;
+
+        // Стили базы.
+        let bstyles: Vec<&Elem> = broot.elems().filter(|e| e.name == "w:style" && e.attr("w:styleId").is_some()).collect();
+        let bnames: HashMap<String, String> = bstyles
+            .iter()
+            .map(|e| {
+                let id = e.attr("w:styleId").unwrap_or("");
+                (id.to_string(), e.child("w:name").and_then(|n| n.val()).unwrap_or(id).to_lowercase())
+            })
+            .collect();
+        let named = |e: &Elem, names: &HashMap<String, String>, sig: &str| {
+            let b = e.child("w:basedOn").and_then(|b| b.val()).map(|b| names.get(b).cloned().unwrap_or_else(|| b.to_lowercase()));
+            format!("basedOn={};{sig}", b.unwrap_or_default())
+        };
+        let mut base: Vec<BRec> = vec![];
+        let mut by_key: HashMap<(String, String), Vec<usize>> = HashMap::new();
+        let mut base_default: HashMap<String, usize> = HashMap::new();
+        for (k, e) in bstyles.iter().enumerate() {
             let id = e.attr("w:styleId").unwrap_or("").to_string();
-            let entry = (id.clone(), style_sig(e, &bnames));
-            by_key.insert(key_of(e, &bnames), entry.clone());
-            base_ids.insert(id.to_lowercase());
-            if matches!(e.attr("w:default"), Some("1" | "true" | "on")) {
-                let ty = e.attr("w:type").unwrap_or("paragraph").to_string();
-                default_types.insert(ty.clone());
-                base_defaults.insert(ty, entry);
+            let ty = e.attr("w:type").unwrap_or("paragraph").to_string();
+            let sig = style_own_sig(e, &bnum);
+            let dsig = self.style_dsig.get(&id).cloned().unwrap_or_else(|| bdd.clone());
+            let name_l = bnames.get(&id).cloned().unwrap_or_else(|| id.to_lowercase());
+            by_key.entry((ty.clone(), name_l.clone())).or_default().push(k);
+            if flag_on(e, "w:default") {
+                base_default.entry(ty.clone()).or_insert(k);
+            }
+            base.push(BRec {
+                named_sig: named(e, &bnames, &sig),
+                sig,
+                dsig,
+                based: e.child("w:basedOn").and_then(|b| b.val()).map(String::from),
+                default: flag_on(e, "w:default"),
+                ty,
+                id,
+            });
+        }
+        // Копии стилей, добавленные из предыдущих документов под другими именами.
+        for (key, ids) in &self.variants {
+            for id in ids {
+                if let Some(k) = base.iter().position(|b| b.id == *id) {
+                    by_key.entry(key.clone()).or_default().push(k);
+                }
             }
         }
-        let mut conflicts: Vec<String> = vec![];
-        let mut to_import: Vec<Elem> = vec![];
-        let mut src_default_para: Option<String> = None;
-        for st in sroot.elems().filter(|e| e.name == "w:style") {
-            let Some(id) = st.attr("w:styleId") else { continue };
-            if st.attr("w:type").unwrap_or("paragraph") == "paragraph" && matches!(st.attr("w:default"), Some("1" | "true" | "on")) {
-                src_default_para = Some(id.to_string());
-            }
-            let key = key_of(st, &snames);
-            let is_default = matches!(st.attr("w:default"), Some("1" | "true" | "on"));
-            let base_default = if is_default { base_defaults.get(&key.0) } else { None };
-            if let Some((bid, bsig)) = by_key.get(&key).or(base_default) {
-                cx.style_map.insert(id.to_string(), bid.clone());
-                if *bsig != style_sig(st, &snames) {
-                    conflicts.push(st.child("w:name").and_then(|n| n.val()).unwrap_or(id).to_string());
-                }
+
+        // Стили источника.
+        let sstyles: Vec<&Elem> = sroot.elems().filter(|e| e.name == "w:style" && e.attr("w:styleId").is_some()).collect();
+        let snames: HashMap<String, String> = sstyles
+            .iter()
+            .map(|e| {
+                let id = e.attr("w:styleId").unwrap_or("");
+                (id.to_string(), e.child("w:name").and_then(|n| n.val()).unwrap_or(id).to_string())
+            })
+            .collect();
+        let snames_l: HashMap<String, String> = snames.iter().map(|(k, v)| (k.clone(), v.to_lowercase())).collect();
+        let sidx: HashMap<String, usize> = sstyles.iter().enumerate().map(|(i, e)| (e.attr("w:styleId").unwrap_or("").to_string(), i)).collect();
+        let mut srec: Vec<SRec> = vec![];
+        for e in &sstyles {
+            let id = e.attr("w:styleId").unwrap_or("").to_string();
+            let name = snames.get(&id).cloned().unwrap_or_else(|| id.clone());
+            let target = |tag: &str| e.child(tag).and_then(|b| b.val()).and_then(|v| sidx.get(v)).copied();
+            srec.push(SRec {
+                el: e,
+                ty: e.attr("w:type").unwrap_or("paragraph").to_string(),
+                name_l: name.to_lowercase(),
+                default: flag_on(e, "w:default"),
+                based: target("w:basedOn"),
+                link: target("w:link"),
+                name,
+                id,
+            });
+        }
+        // Корневые стили абзацев получают docDefaults источника, если они отличаются от базовых.
+        let push = keep && d_diff;
+        let mut pushed: HashMap<usize, Elem> = HashMap::new();
+        let mut sigs = vec![];
+        let mut named_sigs = vec![];
+        for (i, r) in srec.iter().enumerate() {
+            let own = style_own_sig(r.el, &snum);
+            named_sigs.push(named(r.el, &snames_l, &own));
+            if push && r.ty == "paragraph" && r.based.is_none() {
+                let mut c = r.el.clone();
+                push_defaults(&mut c, sroot.child("w:docDefaults"), broot.child("w:docDefaults"), None);
+                sigs.push(style_own_sig(&c, &snum));
+                pushed.insert(i, c);
             } else {
-                let mut new_id = id.to_string();
-                if base_ids.contains(&new_id.to_lowercase()) {
-                    let mut k = 1;
-                    loop {
-                        new_id = format!("{id}_m{k}");
-                        if !base_ids.contains(&new_id.to_lowercase()) {
-                            break;
-                        }
-                        k += 1;
-                    }
-                }
-                base_ids.insert(new_id.to_lowercase());
-                cx.style_map.insert(id.to_string(), new_id.clone());
-                let mut c = st.clone();
-                c.set_attr("w:styleId", new_id);
-                by_key.insert(key, (c.attr("w:styleId").unwrap_or("").to_string(), String::new()));
-                to_import.push(c);
+                sigs.push(own);
             }
         }
-        let tmode = Mode { rels: None };
-        let default_inject_saved = cx.inject_pstyle.take();
-        let mut imported = vec![];
-        for mut c in to_import {
-            let ty = c.attr("w:type").unwrap_or("paragraph").to_string();
-            if default_types.contains(&ty) {
+        // Стиль абзаца «по умолчанию» источника. LibreOffice не помечает «Обычный» атрибутом `w:default`,
+        // но применяет его к абзацам без стиля, поэтому без пометки это стиль с именем «Normal».
+        let def_para = srec
+            .iter()
+            .position(|r| r.ty == "paragraph" && r.default)
+            .or_else(|| srec.iter().position(|r| r.ty == "paragraph" && r.name_l == "normal"));
+        // Какие стили нужны: используемые в содержимом, их родители и связанные стили.
+        let (used, has_tables) = used_styles(src);
+        let mut needed: HashSet<usize> = HashSet::new();
+        let mut stack: Vec<usize> = vec![];
+        for (i, r) in srec.iter().enumerate() {
+            if used.contains(&r.id) || Some(i) == def_para || (r.default && r.ty == "table" && has_tables) {
+                stack.push(i);
+            }
+        }
+        while let Some(i) = stack.pop() {
+            if needed.insert(i) {
+                stack.extend(srec[i].based);
+                stack.extend(srec[i].link);
+                stack.extend(srec.iter().enumerate().filter(|(_, r)| r.link == Some(i)).map(|(j, _)| j));
+            }
+        }
+        let base_ids: HashSet<String> = base.iter().map(|b| b.id.to_lowercase()).collect();
+        let base_names: HashSet<String> = bnames.values().cloned().collect();
+        let n = srec.len();
+        let srec_ids: HashSet<String> = srec.iter().map(|r| r.id.to_lowercase()).collect();
+        let srec_names: HashSet<String> = srec.iter().map(|r| r.name_l.clone()).collect();
+        let mut pl = Planner {
+            keep,
+            src: srec,
+            def_para,
+            base,
+            by_key,
+            base_default,
+            needed,
+            forced: HashSet::new(),
+            dsig: sdd.clone(),
+            sigs,
+            named_sigs,
+            decs: vec![None; n],
+            busy: vec![false; n],
+            taken_ids: base_ids.clone(),
+            taken_names: base_names.clone(),
+            src_ids: srec_ids,
+            src_names: srec_names,
+            base_ids,
+            base_names,
+            ordinal: cx.ordinal,
+            conflicts: vec![],
+        };
+        pl.run();
+
+        // Что делать с каждым стилем: карта идентификаторов, список добавляемых стилей.
+        let mut default_types: HashSet<String> = pl.base.iter().filter(|b| b.default).map(|b| b.ty.clone()).collect();
+        let mut imported: Vec<Elem> = vec![];
+        let mut registered: Vec<(Option<(String, String)>, String)> = vec![];
+        for (i, r) in pl.src.iter().enumerate() {
+            let Some(dec) = &pl.decs[i] else { continue };
+            if let Some(t) = dec.target() {
+                cx.style_map.insert(r.id.clone(), t.to_string());
+            }
+            let Dec::Import { id, name } = dec else { continue };
+            let mut c = pushed.remove(&i).unwrap_or_else(|| r.el.clone());
+            c.set_attr("w:styleId", id.clone());
+            if let Some(nn) = name {
+                match c.child_mut("w:name") {
+                    Some(e) => e.set_attr("w:val", nn.clone()),
+                    None => insert_ordered(&mut c, Elem::new("w:name").with("w:val", nn), STYLE_ORDER),
+                }
+                c.set_attr("w:customStyle", "1");
                 c.remove_attr("w:default");
-            } else if matches!(c.attr("w:default"), Some("1" | "true" | "on")) {
-                default_types.insert(ty);
+                c.children.retain(|n| !matches!(n, Node::Elem(e) if e.name == "w:aliases" || e.name == "w:qFormat"));
+                cx.style_names.insert(r.name_l.clone(), nn.clone());
+                registered.push((Some((r.ty.clone(), r.name_l.clone())), id.clone()));
+            } else {
+                if default_types.contains(&r.ty) {
+                    c.remove_attr("w:default");
+                } else if flag_on(&c, "w:default") {
+                    default_types.insert(r.ty.clone());
+                }
+                registered.push((None, id.clone()));
             }
             imported.push(c);
         }
-        // Преобразуем ссылки внутри импортируемых стилей (их тела не зависят от структуры базы).
+        // Нужен ли отдельный «обычный» стиль, если у источника его нет, а docDefaults отличаются.
+        let src_default_para = pl.def_para;
+        let src_default_tbl = pl.src.iter().position(|r| r.ty == "table" && r.default);
+        // У источника нет стиля абзаца «по умолчанию» (абзацы без стиля получают только docDefaults), а у результата
+        // он есть или docDefaults другие: создаётся пустой стиль с настройками docDefaults источника.
+        if keep && src_default_para.is_none() && (push || pl.base_default.contains_key("paragraph")) {
+            let id = pl.unique_new_id("Normal");
+            let name = pl.fresh_name("Normal");
+            let mut c = Elem::new("w:style")
+                .with("w:type", "paragraph")
+                .with("w:customStyle", "1")
+                .with("w:styleId", &id)
+                .with_child(Elem::new("w:name").with("w:val", &name));
+            if push {
+                push_defaults(&mut c, sroot.child("w:docDefaults"), broot.child("w:docDefaults"), None);
+            }
+            registered.push((None, id.clone()));
+            imported.push(c);
+            cx.default_target = Some(id);
+        }
+        // У абзацев в таблицах свойства стиля таблицы сильнее docDefaults, но слабее явных свойств стиля абзаца.
+        // Перенос docDefaults в «обычный» стиль перекрыл бы стиль таблицы, поэтому для ячеек делается копия
+        // «обычного» стиля без свойств, которые задают стили таблиц.
+        if push && has_tables {
+            let tables: Vec<&Elem> = pl.src.iter().filter(|r| r.ty == "table" && (used.contains(&r.id) || r.default)).map(|r| r.el).collect();
+            let skip = table_ppr_props(&tables);
+            let root_default = match src_default_para {
+                Some(i) => pl.src[i].based.is_none().then(|| (Some(pl.src[i].el.clone()), pl.src[i].id.clone(), pl.src[i].name.clone())),
+                None => Some((None, "Normal".to_string(), "Normal".to_string())),
+            };
+            if let (false, Some((el, id0, name0))) = (skip.is_empty(), root_default) {
+                let id = pl.unique_new_id(&format!("{id0}Cell"));
+                let name = pl.fresh_name(&format!("{name0} в таблице"));
+                let mut c = el.unwrap_or_else(|| Elem::new("w:style").with("w:type", "paragraph").with_child(Elem::new("w:name").with("w:val", &name0)));
+                c.set_attr("w:styleId", id.clone());
+                c.set_attr("w:customStyle", "1");
+                c.remove_attr("w:default");
+                match c.child_mut("w:name") {
+                    Some(e) => e.set_attr("w:val", name),
+                    None => insert_ordered(&mut c, Elem::new("w:name").with("w:val", &name), STYLE_ORDER),
+                }
+                c.children.retain(|n| !matches!(n, Node::Elem(e) if e.name == "w:aliases" || e.name == "w:qFormat"));
+                push_defaults(&mut c, sroot.child("w:docDefaults"), broot.child("w:docDefaults"), Some(&skip));
+                registered.push((None, id.clone()));
+                imported.push(c);
+                cx.cell_target = Some(id);
+                cx.src_default_id = src_default_para.map(|i| pl.src[i].id.clone());
+            }
+        }
+        let conflicts = std::mem::take(&mut pl.conflicts);
+        let tbl_target = src_default_tbl.and_then(|i| pl.decs[i].as_ref().and_then(|d| d.target().map(String::from)));
+        if let Some(i) = src_default_para {
+            cx.default_target = pl.decs[i].as_ref().and_then(|d| d.target().map(String::from));
+        }
+        drop(pl);
+        for (key, id) in registered {
+            self.style_dsig.insert(id.clone(), sdd.clone());
+            if let Some(k) = key {
+                self.variants.entry(k).or_default().push(id);
+            }
+        }
+
+        // Ссылки внутри добавляемых определений (basedOn/next/link, нумерация) переписываются как в содержимом.
+        let tmode = Mode { rels: None };
+        let inject_saved = cx.inject_pstyle.take();
         for c in imported.iter_mut() {
-            // basedOn/next/link, ссылки на нумерацию и стили внутри определения
             xml::walk(c, &mut |e| self.xform_elem(src, cx, &tmode, e));
         }
-        cx.inject_pstyle = default_inject_saved;
+        cx.inject_pstyle = inject_saved;
         let part = self.parts.get_mut("styles").expect("часть стилей загружена");
-        if !imported.is_empty() {
-            for c in imported {
-                part.doc.root.push(c);
-            }
-            part.dirty = true;
+        for c in imported {
+            part.doc.root.push(c);
         }
-        let sdr = sroot.child("w:docDefaults").map(|d| {
-            let mut s = String::new();
-            canon_xml(d, &[], &mut s);
-            s
-        });
-        let bdr = part.doc.root.child("w:docDefaults").map(|d| {
-            let mut s = String::new();
-            canon_xml(d, &[], &mut s);
-            s
-        });
         merge_root_decls(&mut part.doc.root, sroot)?;
         part.dirty = true;
-        // Стиль абзаца «по умолчанию» исходного документа.
-        let base_default = part
+
+        // Стиль абзаца «по умолчанию» исходного документа: абзацы без pStyle получают его явно.
+        let find_default = |ty: &str| {
+            part.doc
+                .root
+                .elems()
+                .find(|e| e.name == "w:style" && e.attr("w:type").unwrap_or("paragraph") == ty && flag_on(e, "w:default"))
+                .and_then(|e| e.attr("w:styleId"))
+                .map(String::from)
+        };
+        let (bd, bt) = (find_default("paragraph"), find_default("table"));
+        if let Some(t) = &cx.default_target {
+            if Some(t) != bd.as_ref() {
+                cx.inject_pstyle = Some(t.clone());
+            }
+        }
+        if has_tables {
+            if let Some(t) = tbl_target.filter(|t| Some(t) != bt.as_ref()) {
+                cx.inject_tblstyle = Some(t);
+            }
+        }
+        // Описание цепочек стилей для проверки нумерации абзацев.
+        cx.style_info = part
             .doc
             .root
             .elems()
-            .find(|e| {
-                e.name == "w:style" && e.attr("w:type").unwrap_or("paragraph") == "paragraph" && matches!(e.attr("w:default"), Some("1" | "true" | "on"))
+            .filter(|e| e.name == "w:style")
+            .filter_map(|e| {
+                let id = e.attr("w:styleId")?.to_string();
+                let ppr = e.child("w:pPr");
+                let numpr = ppr.and_then(|p| p.child("w:numPr"));
+                let ind = ppr.and_then(|p| p.child("w:ind")).map(|i| i.attrs.clone());
+                Some((
+                    id,
+                    StyleLite {
+                        based: e.child("w:basedOn").and_then(|b| b.val()).map(String::from),
+                        num: numpr.and_then(|n| n.child("w:numId")).and_then(|n| n.val()).and_then(|v| v.trim().parse().ok()),
+                        ilvl: numpr.and_then(|n| n.child("w:ilvl")).and_then(|n| n.val()).map(String::from),
+                        ind,
+                    },
+                ))
             })
-            .and_then(|e| e.attr("w:styleId"))
-            .map(String::from);
-        if let (Some(sd), Some(bd)) = (&src_default_para, &base_default) {
-            if let Some(mapped) = cx.style_map.get(sd) {
-                if mapped != bd {
-                    cx.inject_pstyle = Some(mapped.clone());
-                }
-            }
-        }
+            .collect();
+
         let f = cx.file.clone();
-        if !conflicts.is_empty() {
-            conflicts.sort();
-            conflicts.dedup();
-            let shown: Vec<&str> = conflicts.iter().take(6).map(|s| s.as_str()).collect();
-            let more = if conflicts.len() > 6 { format!(" и ещё {}", conflicts.len() - 6) } else { String::new() };
-            self.warn(format!(
-                "«{f}»: стили с теми же именами, но другим оформлением ({}{more}) заменены стилями первого документа — внешний вид текста может отличаться.",
-                shown.join(", ")
-            ));
-        }
-        if let (Some(a), Some(b)) = (sdr, bdr) {
-            if a != b {
+        if !keep {
+            let mut conflicts = conflicts;
+            if !conflicts.is_empty() {
+                conflicts.sort();
+                conflicts.dedup();
+                let shown: Vec<&str> = conflicts.iter().take(6).map(|s| s.as_str()).collect();
+                let more = if conflicts.len() > 6 { format!(" и ещё {}", conflicts.len() - 6) } else { String::new() };
+                self.warn(format!(
+                    "«{f}»: стили с теми же именами, но другим оформлением ({}{more}) заменены стилями первого документа — внешний вид текста может отличаться.",
+                    shown.join(", ")
+                ));
+            }
+            if d_diff {
                 self.warn(format!(
                     "«{f}»: шрифт, размер и интервалы «по умолчанию» отличаются от первого документа — текст без явного оформления может выглядеть иначе."
                 ));
             }
         }
         Ok(())
+    }
+
+    // ---------- нумерация, заданная стилем ----------
+
+    /// Абзацы, нумерация которых задана стилем, общим с другим документом, получают собственный список
+    /// (копия списка с «начать с»), чтобы нумерация не продолжалась из предыдущих документов.
+    fn restart_style_numbering(&mut self, cx: &mut Ctx, e: &mut Elem) {
+        if cx.style_info.is_empty() || e.child("w:pPr").is_some_and(|p| p.child("w:numPr").is_some()) {
+            return;
+        }
+        let target = match e.child("w:pPr").and_then(|p| p.child("w:pStyle")).and_then(|s| s.val()) {
+            Some(v) => cx.style_map.get(v).cloned(),
+            None => cx.default_target.clone(),
+        };
+        let Some(cn) = target.and_then(|t| chain_numbering(&cx.style_info, &t)) else { return };
+        // Списки самого документа (со сдвигом номеров) уже независимы.
+        if cn.num > cx.num_off {
+            return;
+        }
+        let Some((new_num, ilvl)) = self.restart_num(cx, cn.num, &cn.chain, cn.ilvl.clone()) else { return };
+        let mut numpr = Elem::new("w:numPr");
+        if let Some(l) = ilvl {
+            numpr.push(Elem::new("w:ilvl").with("w:val", &l));
+        }
+        // Номера списков при переносе сдвигаются на `num_off` (см. xform_elem), поэтому пишем со смещением.
+        numpr.push(Elem::new("w:numId").with("w:val", &new_num.saturating_sub(cx.num_off).to_string()));
+        if e.child("w:pPr").is_none() {
+            e.children.insert(0, Node::Elem(Elem::new("w:pPr")));
+        }
+        let Some(ppr) = e.child_mut("w:pPr") else { return };
+        insert_ordered(ppr, numpr, PPR_ORDER);
+        // Отступы из стиля сохраняются явно: у абзаца с собственной нумерацией отступ уровня списка сильнее стиля.
+        if let (Some(ind), None) = (cn.ind, ppr.child("w:ind")) {
+            let mut i = Elem::new("w:ind");
+            i.attrs = ind;
+            insert_ordered(ppr, i, PPR_ORDER);
+        }
+    }
+
+    /// Новый список на основе списка `n` результата: те же уровни, но нумерация начинается заново.
+    fn restart_num(&mut self, cx: &mut Ctx, n: u64, chain: &[String], ilvl: Option<String>) -> Option<(u64, Option<String>)> {
+        let part = self.parts.get("numbering")?;
+        let root = &part.doc.root;
+        let parse = |v: Option<&str>| v.and_then(|v| v.trim().parse::<u64>().ok());
+        let num_el = root.elems().find(|e| e.name == "w:num" && parse(e.attr("w:numId")) == Some(n))?;
+        let aid = num_el.child("w:abstractNumId")?.val()?.to_string();
+        let abs = root.elems().find(|e| e.name == "w:abstractNum" && e.attr("w:abstractNumId") == Some(aid.as_str()))?;
+        // Уровень, привязанный к стилю абзаца, если стиль его не указывает.
+        let ilvl = ilvl.or_else(|| {
+            abs.elems()
+                .filter(|l| l.name == "w:lvl")
+                .find(|l| l.child("w:pStyle").and_then(|p| p.val()).is_some_and(|p| chain.iter().any(|c| c == p)))
+                .and_then(|l| l.attr("w:ilvl").map(String::from))
+        });
+        if let Some(r) = cx.restart.get(&n) {
+            return r.map(|id| (id, ilvl));
+        }
+        let lvls: Vec<&Elem> = abs.elems().filter(|l| l.name == "w:lvl").collect();
+        // Маркированный список не нумерует — перезапуск не нужен.
+        let counts = lvls.iter().any(|l| !matches!(l.child("w:numFmt").and_then(|f| f.val()), Some("bullet" | "none")));
+        if !counts {
+            cx.restart.insert(n, None);
+            return None;
+        }
+        if cx.next_num == 0 {
+            let max = root.elems().filter(|e| e.name == "w:num").filter_map(|e| parse(e.attr("w:numId"))).max().unwrap_or(0);
+            cx.next_num = max + 1;
+        }
+        let id = cx.next_num;
+        cx.next_num += 1;
+        let mut nn = Elem::new("w:num").with("w:numId", &id.to_string()).with_child(Elem::new("w:abstractNumId").with("w:val", &aid));
+        let own: Vec<&Elem> = num_el.elems().filter(|o| o.name == "w:lvlOverride").collect();
+        let mut done: HashSet<String> = HashSet::new();
+        for l in &lvls {
+            let Some(k) = l.attr("w:ilvl") else { continue };
+            done.insert(k.to_string());
+            let start = |lv: &Elem| lv.child("w:start").and_then(|s| s.val()).unwrap_or("1").to_string();
+            match own.iter().find(|o| o.attr("w:ilvl") == Some(k)) {
+                Some(o) => {
+                    let mut o = (*o).clone();
+                    if o.child("w:startOverride").is_none() {
+                        let st = o.child("w:lvl").map(start).unwrap_or_else(|| start(l));
+                        o.children.insert(0, Node::Elem(Elem::new("w:startOverride").with("w:val", &st)));
+                    }
+                    nn.push(o);
+                }
+                None => nn.push(
+                    Elem::new("w:lvlOverride").with("w:ilvl", k).with_child(Elem::new("w:startOverride").with("w:val", &start(l))),
+                ),
+            }
+        }
+        for o in own {
+            if o.attr("w:ilvl").is_some_and(|k| !done.contains(k)) {
+                nn.push(o.clone());
+            }
+        }
+        let part = self.parts.get_mut("numbering")?;
+        let at = part
+            .doc
+            .root
+            .children
+            .iter()
+            .rposition(|c| matches!(c, Node::Elem(e) if e.name == "w:num"))
+            .or_else(|| part.doc.root.children.iter().rposition(|c| matches!(c, Node::Elem(e) if e.name == "w:abstractNum")))
+            .map_or(part.doc.root.children.len(), |i| i + 1);
+        part.doc.root.children.insert(at, Node::Elem(nn));
+        part.dirty = true;
+        cx.restart.insert(n, Some(id));
+        Some((id, ilvl))
     }
 
     // ---------- нумерация ----------
@@ -2276,6 +3683,7 @@ impl Merger {
                 c.set_attr("w:id", new);
                 cx.ranges.clear();
                 xml::walk(&mut c, &mut |x| self.xform_elem(src, cx, &mode, x));
+                cx.toc += rename_field_instrs(&mut c, &cx.bm_rename, &cx.style_names);
                 items.push(c);
             }
             let part = self.parts.get_mut(key).expect("часть загружена");
@@ -2404,11 +3812,13 @@ impl Merger {
                 s.children.retain(|n| !matches!(n, Node::Elem(e) if e.name == "w:type"));
             }
             let defined: HashSet<(bool, String)> = sect_refs(s).into_iter().collect();
+            // Страница с особым колонтитулом первой страницы без него остаётся пустой (а не берёт чужой).
+            let title_pg = s.child("w:titlePg").is_some_and(|t| !matches!(t.val(), Some("0" | "false" | "off")));
             let mut add = vec![];
             for footer in [false, true] {
                 for t in HF_TYPES {
                     let key = (footer, t.to_string());
-                    if self.hf_state.contains(&key) && !defined.contains(&key) {
+                    if (self.hf_state.contains(&key) || (title_pg && t == "first")) && !defined.contains(&key) {
                         let rid = self.empty_story(cx, footer);
                         add.push(
                             Elem::new(if footer { "w:footerReference" } else { "w:headerReference" })
@@ -2428,20 +3838,55 @@ impl Merger {
         }
     }
 
+    // ---------- колонтитулы чётных и нечётных страниц ----------
+
+    /// Настройка «разные колонтитулы для чётных и нечётных страниц» действует на весь файл. Если она нужна
+    /// хотя бы одному документу, она включается, а документам без неё на чётные страницы копируется
+    /// колонтитул «по умолчанию» (тот же объект): их страницы выглядят как раньше.
+    fn enable_even_odd(&mut self) -> Result<()> {
+        if !self.any_even {
+            return Ok(());
+        }
+        if !self.load_part("settings")? {
+            let root = Elem::new("w:settings").with("xmlns:w", "http://schemas.openxmlformats.org/wordprocessingml/2006/main");
+            self.create_part("settings", root);
+        }
+        let part = self.parts.get_mut("settings").expect("настройки загружены");
+        if setting_on(&part.doc.root, "w:evenAndOddHeaders") {
+            return Ok(());
+        }
+        part.doc.root.children.retain(|n| !matches!(n, Node::Elem(e) if e.name == "w:evenAndOddHeaders"));
+        insert_ordered(&mut part.doc.root, Elem::new("w:evenAndOddHeaders"), SETTINGS_ORDER);
+        part.dirty = true;
+        // Разделы первого документа.
+        let mut added = add_even_refs(&mut self.final_sect);
+        for n in self.body.iter_mut() {
+            if let Some(s) = para_sect_mut(n) {
+                added |= add_even_refs(s);
+            }
+        }
+        if added {
+            self.hf_state.insert((false, "even".into()));
+            self.hf_state.insert((true, "even".into()));
+        }
+        Ok(())
+    }
+
     // ---------- проверки совместимости ----------
 
-    fn compat_checks(&mut self, src: &Src, cx: &Ctx) -> Result<()> {
+    fn compat_checks(&mut self, src: &Src, cx: &mut Ctx) -> Result<()> {
         let f = cx.file.clone();
         // Настройки документа, которые действуют на весь файл.
-        let flags = [
-            ("w:evenAndOddHeaders", "разные колонтитулы для чётных и нечётных страниц"),
-            ("w:mirrorMargins", "зеркальные поля"),
-            ("w:gutterAtTop", "поле переплёта сверху"),
-        ];
+        let flags = [("w:mirrorMargins", "зеркальные поля"), ("w:gutterAtTop", "поле переплёта сверху")];
         let base_has = |this: &Self, tag: &str| this.parts.get("settings").is_some_and(|p| p.doc.root.child(tag).is_some());
         self.load_part("settings")?;
+        let mut src_bg_shape = false;
+        let mut src_settings: Option<Elem> = None;
         if let Some(sp) = src.part_path("settings") {
             let sdoc = src.load_xml(&sp)?;
+            cx.src_even = setting_on(&sdoc.root, "w:evenAndOddHeaders");
+            src_bg_shape = setting_on(&sdoc.root, "w:displayBackgroundShape");
+            src_settings = Some(sdoc.root.clone());
             for (tag, what) in flags {
                 if sdoc.root.child(tag).is_some() != base_has(self, tag) {
                     self.warn(format!(
@@ -2458,6 +3903,44 @@ impl Merger {
                 }
             }
         }
+        // Режим совместимости (параметры вёрстки) общий для всего файла: слегка влияет на интервалы и разбивку.
+        let compat_of = |root: Option<&Elem>| -> (String, Vec<String>) {
+            let Some(c) = root.and_then(|r| r.child("w:compat")) else { return ("12".into(), vec![]) };
+            let mode = c
+                .elems()
+                .find(|e| e.name == "w:compatSetting" && e.attr("w:name") == Some("compatibilityMode"))
+                .and_then(|e| e.attr("w:val"))
+                .unwrap_or("12")
+                .to_string();
+            let mut flags: Vec<String> = c.elems().filter(|e| e.name != "w:compatSetting" && !matches!(e.val(), Some("0" | "false" | "off"))).map(|e| e.name.clone()).collect();
+            flags.sort();
+            (mode, flags)
+        };
+        let base_compat = compat_of(self.parts.get("settings").map(|p| &p.doc.root));
+        if compat_of(src_settings.as_ref()) != base_compat {
+            self.warn(format!(
+                "«{f}»: режим совместимости документа (параметры вёрстки) отличается от первого документа; используется режим первого документа — интервалы и разбивка на страницы могут немного измениться."
+            ));
+        }
+        // Фон страницы общий для всего файла: используется фон первого документа.
+        let bg_sig = |root: &Elem, shape: bool| {
+            let mut s = String::new();
+            if let Some(b) = root.child("w:background") {
+                canon_xml(b, &[], &mut s);
+            }
+            (s, shape)
+        };
+        let base_shape = self.parts.get("settings").is_some_and(|p| setting_on(&p.doc.root, "w:displayBackgroundShape"));
+        let (sb, bb) = (bg_sig(&src.doc.root, src_bg_shape), bg_sig(&self.doc.root, base_shape));
+        if sb.0 != bb.0 {
+            self.warn(if sb.0.is_empty() {
+                format!("«{f}»: у первого документа задан фон страницы — он будет применён и к страницам этого документа (в Word фон общий для всего файла).")
+            } else if bb.0.is_empty() {
+                format!("«{f}»: фон страницы этого документа не перенесён (в Word фон общий для всего файла, у первого документа фона нет).")
+            } else {
+                format!("«{f}»: фон страницы этого документа отличается от первого документа; используется фон первого документа (в Word фон общий для всего файла).")
+            });
+        }
         // Встроенные (внедрённые) шрифты не переносятся.
         let embedded = src
             .rels
@@ -2465,44 +3948,44 @@ impl Merger {
             .iter()
             .filter(|r| !r.external && rel_suffix(&r.ty) == "fontTable")
             .filter_map(|r| resolve_part(&src.pkg, &src.main, &r.target))
-            .any(|p| src.pkg.get(&rels_path(&p)).is_some_and(|b| String::from_utf8_lossy(b).contains("/font\"")));
+            .any(|p| src.pkg.get(&rels_path(&p)).and_then(|b| Rels::parse(b).ok()).is_some_and(|r| r.items.iter().any(|x| rel_suffix(&x.ty) == "font")));
         if embedded {
             self.warn(format!(
                 "«{f}»: встроенные в документ шрифты не переносятся; если этих шрифтов нет на компьютере, они будут заменены."
             ));
         }
         // Тема оформления (цвета и шрифты темы).
-        let uses_theme = |bytes: Option<&[u8]>| {
-            bytes.is_some_and(|b| {
-                let s = String::from_utf8_lossy(b);
-                ["Theme=\"", "themeColor=\"", "themeFill=\"", "themeShade=\"", "themeTint=\""].iter().any(|k| s.contains(k))
+        let uses_theme = |pkg: &Pkg, path: Option<String>| {
+            path.and_then(|p| pkg.get(&p)).and_then(|b| xml::decode(b).ok()).is_some_and(|s| {
+                ["Theme=\"", "themeColor=\"", "themeFill=\"", "themeShade=\"", "themeTint=\"", "schemeClr"].iter().any(|k| s.contains(k))
             })
         };
-        let styles_bytes = src.part_path("styles").and_then(|p| src.pkg.get(&p));
-        if uses_theme(src.pkg.get(&src.main)) || uses_theme(styles_bytes) {
-            let theme_sig = |pkg: &Pkg, owner_rels: &Rels, owner: &str| -> Option<String> {
-                let p = owner_rels
-                    .items
-                    .iter()
-                    .filter(|r| !r.external && rel_suffix(&r.ty) == "theme")
-                    .find_map(|r| resolve_part(pkg, owner, &r.target))?;
-                let d = xml::parse(pkg.get(&p)?).ok()?;
-                let te = d.root.child("a:themeElements")?;
-                let mut s = String::new();
-                for c in te.elems().filter(|c| c.name == "a:clrScheme" || c.name == "a:fontScheme") {
-                    canon_xml(c, &[], &mut s);
-                }
-                Some(s)
-            };
+        let mut parts = vec![Some(src.main.clone()), src.part_path("styles"), src.part_path("numbering")];
+        for r in src.rels.items.iter().filter(|r| !r.external && matches!(rel_suffix(&r.ty), "header" | "footer" | "footnotes" | "endnotes")) {
+            parts.push(resolve_part(&src.pkg, &src.main, &r.target));
+        }
+        if parts.into_iter().any(|p| uses_theme(&src.pkg, p)) {
             let main = self.main.clone();
             let brels = self.rels_mut(&main).clone();
-            let a = theme_sig(&src.pkg, &src.rels, &src.main);
-            let b = theme_sig(&self.pkg, &brels, &main);
-            if let (Some(a), Some(b)) = (a, b) {
-                if a != b {
-                    self.warn(format!(
-                        "«{f}»: тема оформления (цвета и шрифты темы) отличается от первого документа; текст, оформленный цветами и шрифтами темы, может выглядеть иначе."
-                    ));
+            let a = load_theme(&src.pkg, &src.rels, &src.main);
+            let b = load_theme(&self.pkg, &brels, &main);
+            if let Some(a) = a {
+                if b.as_ref().is_none_or(|b| b.sig != a.sig) {
+                    cx.theme_diff = true;
+                    if self.keep {
+                        // Цвета и шрифты темы заменяются явными значениями — вид текста сохраняется.
+                        cx.theme = Some(a);
+                        let objects = src.rels.items.iter().any(|r| matches!(rel_suffix(&r.ty), "chart" | "diagramData" | "diagramColors"));
+                        if objects {
+                            self.warn(format!(
+                                "«{f}»: тема оформления отличается от первого документа; цвета и шрифты темы заменены явными значениями, кроме диаграмм и SmartArt — их цвета могут отличаться."
+                            ));
+                        }
+                    } else {
+                        self.warn(format!(
+                            "«{f}»: тема оформления (цвета и шрифты темы) отличается от первого документа; текст, оформленный цветами и шрифтами темы, может выглядеть иначе."
+                        ));
+                    }
                 }
             }
         }
@@ -2529,9 +4012,10 @@ impl Merger {
             self.body = tmp.children;
         }
         self.touched = true;
-        let mut cx = Ctx { file: src.name.clone(), ..Default::default() };
+        self.appended += 1;
+        let mut cx = Ctx { file: src.name.clone(), ordinal: self.appended + 1, ..Default::default() };
         merge_root_decls(&mut self.doc.root, &src.doc.root)?;
-        self.compat_checks(&src, &cx)?;
+        self.compat_checks(&src, &mut cx)?;
         self.numbering_offsets(&mut cx)?;
         self.merge_styles(&src, &mut cx)?;
         self.merge_numbering(&src, &mut cx)?;
@@ -2557,12 +4041,25 @@ impl Merger {
         // Сноски и примечания переносятся до тела: они задают карту идентификаторов.
         self.import_notes(&src, &mut cx, notes)?;
         let mode = Mode { rels: Some((src.main.clone(), self.main.clone())) };
+        if cx.cell_target.is_some() {
+            mark_cell_paragraphs(&mut tmp, false);
+        }
         xml::walk(&mut tmp, &mut |e| self.xform_elem(&src, &mut cx, &mode, e));
+        cx.toc += rename_field_instrs(&mut tmp, &cx.bm_rename, &cx.style_names);
         self.import_comment_parts(&src, &mut cx)?;
 
         let Some(Node::Elem(f)) = tmp.children.pop() else { bail!("внутренняя ошибка: потерян раздел документа") };
         fin = f;
         let mut nodes = tmp.children;
+        // Настройка чётных/нечётных колонтитулов общая: документ без неё получает колонтитулы и на чётных страницах.
+        if self.any_even && !cx.src_even {
+            for n in nodes.iter_mut() {
+                if let Some(s) = para_sect_mut(n) {
+                    add_even_refs(s);
+                }
+            }
+            add_even_refs(&mut fin);
+        }
         let mut first = true;
         for i in 0..nodes.len() {
             if let Some(s) = para_sect_mut(&mut nodes[i]) {
@@ -2581,6 +4078,11 @@ impl Merger {
             self.warn(format!(
                 "«{f}»: привязка элементов управления к данным (XML-хранилище) не переносится — содержимое сохранено как обычный текст ({} шт.).",
                 cx.dropped_bindings
+            ));
+        }
+        if cx.toc > 0 {
+            self.warn(format!(
+                "«{f}»: в документе есть оглавление или указатель — номера страниц в них остались прежними; после объединения обновите поля в Word (Ctrl+A, затем F9)."
             ));
         }
         if cx.dropped_refs > 0 {
@@ -2615,11 +4117,12 @@ impl Merger {
     }
 }
 
-/// Объединяет документы `.docx` по порядку; возвращает предупреждения для пользователя.
 /// Параметры объединения документов.
 #[derive(Clone, Debug)]
 pub struct Options {
-    /// Сохранять оформление каждого документа (стили с одним именем, но разным видом не подменяются стилями первого).
+    /// Сохранять оформление каждого документа: стиль следующего документа с тем же именем, но другим
+    /// определением, добавляется под новым именем («Заголовок 1 (2)»), а не заменяется стилем первого.
+    /// Выключено — как при вставке файла в Word: побеждают стили первого документа.
     pub keep_source_styles: bool,
 }
 
@@ -2629,13 +4132,21 @@ impl Default for Options {
     }
 }
 
-pub fn merge(inputs: &[PathBuf], out: &Path, _opts: &Options) -> Result<Vec<String>> {
+/// Объединяет документы `.docx` по порядку; возвращает предупреждения для пользователя.
+pub fn merge(inputs: &[PathBuf], out: &Path, opts: &Options) -> Result<Vec<String>> {
     let (first, rest) = inputs.split_first().ok_or_else(|| anyhow!("нет файлов"))?;
-    let base = Src::load(first)?;
-    let mut m = Merger::new(base).with_context(|| format!("при разборе {}", first.display()))?;
+    // Ко всем ошибкам добавляется имя файла, к которому они относятся.
+    let of = |p: &Path, e: anyhow::Error| {
+        anyhow!("«{}»: {e:#}", p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default())
+    };
+    let base = Src::load(first).map_err(|e| of(first, e))?;
+    let mut m = Merger::new(base).map_err(|e| of(first, e))?;
+    m.keep = opts.keep_source_styles;
+    m.any_even = inputs.iter().any(|p| peek_even_odd(p));
+    m.enable_even_odd()?;
     for p in rest {
-        let src = Src::load(p)?;
-        m.append(src).with_context(|| format!("при добавлении {}", p.display()))?;
+        let src = Src::load(p).map_err(|e| of(p, e))?;
+        m.append(src).map_err(|e| of(p, e))?;
     }
     m.finish(out)
 }
@@ -2759,6 +4270,15 @@ mod tests {
     }
 
     fn run(dir: &Path, name: &str, docs: &[&Fx]) -> (PathBuf, Vec<String>) {
+        run_opts(dir, name, docs, &Options::default())
+    }
+
+    /// Режим «как в Word»: побеждают стили первого документа.
+    fn run_base_wins(dir: &Path, name: &str, docs: &[&Fx]) -> (PathBuf, Vec<String>) {
+        run_opts(dir, name, docs, &Options { keep_source_styles: false })
+    }
+
+    fn run_opts(dir: &Path, name: &str, docs: &[&Fx], opts: &Options) -> (PathBuf, Vec<String>) {
         let mut paths = vec![];
         for (i, d) in docs.iter().enumerate() {
             let p = dir.join(format!("{name}_in{i}.docx"));
@@ -2766,7 +4286,7 @@ mod tests {
             paths.push(p);
         }
         let out = dir.join(format!("{name}_out.docx"));
-        let w = merge(&paths, &out, &Options::default()).unwrap();
+        let w = merge(&paths, &out, opts).unwrap();
         let errs = check(&out);
         assert!(errs.is_empty(), "{name}: пакет некорректен: {errs:#?}");
         (out, w)
@@ -2901,6 +4421,58 @@ mod tests {
             }
             errs.extend(dups("numId", all(&n.root, "w:num").iter().filter_map(|e| e.attr("w:numId").map(String::from)).collect()));
             errs.extend(dups("abstractNumId", all(&n.root, "w:abstractNum").iter().filter_map(|e| e.attr("w:abstractNumId").map(String::from)).collect()));
+        }
+        // стили: уникальные id и имена, все ссылки указывают на существующие стили
+        if let Some(st) = docs.get("word/styles.xml") {
+            let styles: Vec<&Elem> = st.root.elems().filter(|e| e.name == "w:style").collect();
+            let ids: Vec<String> = styles.iter().filter_map(|e| e.attr("w:styleId").map(String::from)).collect();
+            errs.extend(dups("styleId", ids.iter().map(|i| i.to_lowercase()).collect()));
+            errs.extend(dups("имя стиля", styles.iter().filter_map(|e| e.child("w:name").and_then(|n| n.val()).map(|n| n.to_lowercase())).collect()));
+            for e in &styles {
+                for tag in ["w:basedOn", "w:next", "w:link"] {
+                    if let Some(v) = e.child(tag).and_then(|c| c.val()) {
+                        if !ids.iter().any(|i| i == v) {
+                            errs.push(format!("стиль {:?}: {tag} -> {v} не существует", e.attr("w:styleId")));
+                        }
+                    }
+                }
+            }
+            for r in &stories {
+                for tag in ["w:pStyle", "w:rStyle", "w:tblStyle"] {
+                    for e in all(r, tag) {
+                        let v = e.val().unwrap_or("");
+                        if !ids.iter().any(|i| i == v) {
+                            errs.push(format!("{tag} {v} без стиля"));
+                        }
+                    }
+                }
+            }
+        }
+        // списки: используемые номера существуют
+        let num_ids: Vec<String> = docs
+            .get("word/numbering.xml")
+            .map(|n| all(&n.root, "w:num").iter().filter_map(|e| e.attr("w:numId").map(String::from)).collect())
+            .unwrap_or_default();
+        let mut num_roots: Vec<&Elem> = stories.clone();
+        if let Some(st) = docs.get("word/styles.xml") {
+            num_roots.push(&st.root);
+        }
+        for r in num_roots {
+            for e in all(r, "w:numId") {
+                let v = e.val().unwrap_or("");
+                if v != "0" && !num_ids.iter().any(|i| i == v) {
+                    errs.push(format!("numId {v} не определён"));
+                }
+            }
+        }
+        // колонтитулы одного раздела: типы не повторяются
+        for sp in all(&main.root, "w:sectPr") {
+            let mut seen = HashSet::new();
+            for r in sp.elems().filter(|e| e.name == "w:headerReference" || e.name == "w:footerReference") {
+                if !seen.insert((r.name.clone(), r.attr("w:type").unwrap_or("default").to_string())) {
+                    errs.push("повторная ссылка на колонтитул одного типа".into());
+                }
+            }
         }
         let body = main.root.child("w:body").unwrap();
         if body.elems().filter(|e| e.name == "w:sectPr").count() != 1 || body.elems().last().map(|e| e.name.as_str()) != Some("w:sectPr") {
@@ -3280,7 +4852,7 @@ mod tests {
         b.styles = styles_xml("").replace(r#"w:styleId="Normal""#, r#"w:styleId="a""#).replace(r#"w:val="Normal""#, r#"w:val="a""#).replace(r#"w:styleId="Heading1""#, r#"w:styleId="1""#).replace("<w:b/>", "<w:i/>")
             .replace("</w:styles>", r#"<w:style w:type="paragraph" w:customStyle="1" w:styleId="Mine"><w:name w:val="Mine"/><w:basedOn w:val="a"/></w:style></w:styles>"#);
         b.body = b.body.replace("plain", "plain</w:t></w:r></w:p><w:p><w:pPr><w:pStyle w:val=\"Mine\"/></w:pPr><w:r><w:t>mine");
-        let (out, w) = run(dir.path(), "styles", &[&a, &b]);
+        let (out, w) = run_base_wins(dir.path(), "styles", &[&a, &b]);
         let (pkg, d) = doc_of(&out);
         let st = xml::parse(pkg.get("word/styles.xml").unwrap()).unwrap();
         let styles: Vec<&Elem> = st.root.elems().filter(|e| e.name == "w:style").collect();
@@ -3302,7 +4874,7 @@ mod tests {
         let a = fx(&format!("{}{}", para("A"), sect("")));
         let mut b = fx(&format!("{}{}", para("B"), sect("")));
         b.styles = styles_xml("").replace(r#"w:val="22""#, r#"w:val="30""#);
-        let (_, w) = run(dir.path(), "dd", &[&a, &b]);
+        let (_, w) = run_base_wins(dir.path(), "dd", &[&a, &b]);
         assert!(w.iter().any(|m| m.contains("по умолчанию")), "{w:?}");
     }
 
@@ -3418,16 +4990,30 @@ mod tests {
                 .ct("/word/theme/theme1.xml", "application/vnd.openxmlformats-officedocument.theme+xml")
         };
         let a = base("", "FF0000");
-        let b = base("<w:evenAndOddHeaders/>", "00FF00")
+        let b = base("<w:mirrorMargins/><w:evenAndOddHeaders/>", "00FF00")
             .part("word/fontTable.xml", r#"<w:fonts xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"/>"#)
             .part("word/_rels/fontTable.xml.rels", format!(r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="{RT}font" Target="fonts/font1.odttf"/></Relationships>"#))
             .part("word/fonts/font1.odttf", b"F")
             .rel("rFt", "fontTable", "fontTable.xml")
             .ct("/word/fontTable.xml", &format!("{CT_NOTES}fontTable+xml"))
             .ct("/word/fonts/font1.odttf", "application/vnd.openxmlformats-officedocument.obfuscatedFont");
-        let (_, w) = run(dir.path(), "compat", &[&a, &b]);
-        assert!(w.iter().any(|m| m.contains("чётных")), "{w:?}");
+        let (out, w) = run(dir.path(), "compat", &[&a, &b]);
+        assert!(w.iter().any(|m| m.contains("зеркальные поля")), "{w:?}");
+        // чётные/нечётные колонтитулы — не потеря: настройка включается для всего файла, предупреждения нет
+        assert!(!w.iter().any(|m| m.contains("чётных")), "{w:?}");
+        let pkg = Pkg::read(&out).unwrap();
+        let settings = xml::parse(pkg.get("word/settings.xml").unwrap()).unwrap();
+        assert!(setting_on(&settings.root, "w:evenAndOddHeaders"));
         assert!(w.iter().any(|m| m.contains("встроенные")), "{w:?}");
+        // тема отличается: цвета и шрифты темы второго документа заменены явными значениями, предупреждения нет
+        assert!(!w.iter().any(|m| m.contains("тема оформления")), "{w:?}");
+        let d = doc_of(&out).1;
+        let colors = all(&d.root, "w:color");
+        assert_eq!(colors.len(), 2);
+        assert!(colors[0].attr("w:themeColor").is_some(), "первый документ не меняется");
+        assert!(colors[1].attr("w:themeColor").is_none() && colors[1].val() == Some("000000"));
+        // в режиме «как в Word» тема первого документа — с предупреждением
+        let (_, w) = run_base_wins(dir.path(), "compat_wins", &[&a, &b]);
         assert!(w.iter().any(|m| m.contains("тема оформления")), "{w:?}");
         // одинаковые файлы — без предупреждений
         let (_, w) = run(dir.path(), "same", &[&a, &a]);
@@ -3449,5 +5035,707 @@ mod tests {
             let names: Vec<&str> = ppr.elems().map(|e| e.name.as_str()).collect();
             assert_eq!(names.last(), Some(&"w:sectPr"), "{names:?}");
         }
+    }
+
+    // ───────── оформление каждого документа, нумерация стилей, поля, колонтитулы, ошибки ─────────
+
+    const WNS: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+
+    fn numbering_xml(fmt: &str) -> String {
+        format!(
+            r#"<?xml version="1.0"?><w:numbering xmlns:w="{WNS}"><w:abstractNum w:abstractNumId="0"><w:nsid w:val="AAAAAAAA"/><w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="{fmt}"/><w:lvlText w:val="%1."/></w:lvl></w:abstractNum><w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num></w:numbering>"#
+        )
+    }
+
+    fn style_list(pkg: &Pkg) -> Vec<Elem> {
+        let st = xml::parse(pkg.get("word/styles.xml").unwrap()).unwrap();
+        st.root.elems().filter(|e| e.name == "w:style").cloned().collect()
+    }
+
+    fn style_name(s: &Elem) -> String {
+        s.child("w:name").and_then(|n| n.val()).unwrap_or("").to_string()
+    }
+
+    fn pstyles(d: &xml::Doc) -> Vec<String> {
+        all(&d.root, "w:pStyle").iter().map(|e| e.val().unwrap().to_string()).collect()
+    }
+
+    /// Документ со стилем «List Number» (нумерация в стиле) и тремя пунктами.
+    fn numbered_doc(fmt: &str, items: &str) -> Fx {
+        let mut f = fx(&format!(
+            r#"{}{}"#,
+            ["1", "2"].iter().map(|_| format!(r#"<w:p><w:pPr><w:pStyle w:val="ListNumber"/></w:pPr><w:r><w:t>{items}</w:t></w:r></w:p>"#)).collect::<String>(),
+            sect("")
+        ));
+        f.styles = styles_xml(
+            r#"<w:style w:type="paragraph" w:styleId="ListNumber"><w:name w:val="List Number"/><w:basedOn w:val="Normal"/><w:pPr><w:numPr><w:numId w:val="1"/></w:numPr><w:ind w:left="720"/></w:pPr></w:style>"#,
+        );
+        f.numbering = Some(numbering_xml(fmt));
+        f
+    }
+
+    #[test]
+    fn conflicting_styles_are_kept_under_new_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = fx(&format!(r#"<w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>A</w:t></w:r></w:p>{}"#, sect("")));
+        // у второго документа другой «Normal» и другой «heading 1»; ещё один свой стиль опирается на «heading 1»
+        let mut b = fx(&format!(
+            r#"<w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>B</w:t></w:r></w:p><w:p><w:r><w:t>plain</w:t></w:r></w:p><w:p><w:pPr><w:pStyle w:val="Mine"/></w:pPr><w:r><w:t>mine</w:t></w:r></w:p>{}"#,
+            sect("")
+        ));
+        b.styles = styles_xml(r#"<w:style w:type="paragraph" w:customStyle="1" w:styleId="Mine"><w:name w:val="Mine"/><w:basedOn w:val="Heading1"/><w:next w:val="Normal"/></w:style>"#)
+            .replace("<w:b/>", "<w:i/>")
+            .replace(r#"<w:name w:val="Normal"/></w:style>"#, r#"<w:name w:val="Normal"/><w:rPr><w:sz w:val="40"/></w:rPr></w:style>"#);
+        let (out, w) = run(dir.path(), "keep", &[&a, &b, &b]);
+        assert!(w.is_empty(), "оформление сохранено — предупреждений нет: {w:?}");
+        let (pkg, d) = doc_of(&out);
+        let styles = style_list(&pkg);
+        let by_name = |n: &str| styles.iter().find(|s| style_name(s) == n).unwrap_or_else(|| panic!("нет стиля {n}"));
+        // стили первого документа не тронуты, у копий новые id и имена, повторов нет
+        assert_eq!(by_name("heading 1").child("w:rPr").unwrap().elems().next().unwrap().name, "w:b");
+        let h1 = by_name("heading 1 (2)");
+        assert_ne!(h1.attr("w:styleId"), Some("Heading1"));
+        assert_eq!(h1.attr("w:customStyle"), Some("1"));
+        assert!(h1.attr("w:default").is_none());
+        assert_eq!(h1.child("w:rPr").unwrap().elems().next().unwrap().name, "w:i");
+        assert_eq!(styles.len(), 2 + 3, "Normal, heading 1 и копии Normal, heading 1, а также Mine: {:?}", styles.iter().map(style_name).collect::<Vec<_>>());
+        // «Mine» есть только у второго документа (имя не занято) — добавляется как есть и опирается на копию «heading 1»
+        let mine = by_name("Mine");
+        assert_eq!(mine.child("w:basedOn").unwrap().val(), h1.attr("w:styleId"));
+        let normal2 = by_name("Normal (2)");
+        assert_eq!(mine.child("w:next").unwrap().val(), normal2.attr("w:styleId"));
+        // ссылки второго и третьего документов идут на копии; абзац без стиля получает копию «Normal»
+        let ps = pstyles(&d);
+        let n2 = normal2.attr("w:styleId").unwrap();
+        assert_eq!(ps, ["Heading1", h1.attr("w:styleId").unwrap(), n2, mine.attr("w:styleId").unwrap(), h1.attr("w:styleId").unwrap(), n2, mine.attr("w:styleId").unwrap()]);
+        // третий документ совпадает со вторым — своих копий («(3)») он не заводит
+        assert!(!styles.iter().any(|s| style_name(s).ends_with("(3)")));
+        // режим «как в Word»: побеждают стили первого документа, предупреждение остаётся
+        let (out, w) = run_base_wins(dir.path(), "wins", &[&a, &b]);
+        assert!(w.iter().any(|m| m.contains("heading 1")), "{w:?}");
+        let (pkg, d) = doc_of(&out);
+        assert_eq!(style_list(&pkg).len(), 3);
+        assert_eq!(pstyles(&d), ["Heading1", "Heading1", "Mine"]);
+    }
+
+    #[test]
+    fn identical_styles_are_not_duplicated() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = fx(&format!(r#"<w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>A</w:t></w:r></w:p>{}"#, sect("")));
+        let (out, w) = run(dir.path(), "same_styles", &[&a, &a, &a]);
+        assert!(w.is_empty(), "{w:?}");
+        let (pkg, d) = doc_of(&out);
+        assert_eq!(style_list(&pkg).len(), 2);
+        assert_eq!(pstyles(&d), ["Heading1"; 3]);
+        // абзацы без стиля остаются без стиля
+        let b = fx(&format!("{}{}", para("P"), sect("")));
+        let (out, _) = run(dir.path(), "same_plain", &[&b, &b]);
+        assert!(pstyles(&doc_of(&out).1).is_empty());
+    }
+
+    #[test]
+    fn default_formatting_is_pushed_into_normal_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        // у первого документа есть «лишний» интервал и размер 11, у второго — размер 15 и без интервала
+        let mut a = fx(&format!("{}{}", para("A"), sect("")));
+        a.styles = styles_xml("").replace("</w:rPrDefault>", r#"</w:rPrDefault><w:pPrDefault><w:pPr><w:spacing w:after="200" w:line="276" w:lineRule="auto"/></w:pPr></w:pPrDefault>"#);
+        let mut b = fx(&format!("{}<w:tbl><w:tblPr/><w:tr><w:tc>{}</w:tc></w:tr></w:tbl>{}", para("B"), para("cell"), sect("")));
+        b.styles = styles_xml("").replace(r#"w:val="22""#, r#"w:val="30""#);
+        let (out, w) = run(dir.path(), "dd_keep", &[&a, &b]);
+        assert!(w.is_empty(), "{w:?}");
+        let (pkg, d) = doc_of(&out);
+        let styles = style_list(&pkg);
+        let n2 = styles.iter().find(|s| style_name(s) == "Normal (2)").expect("копия Normal");
+        let rpr = n2.child("w:rPr").unwrap();
+        assert_eq!(rpr.child("w:sz").unwrap().val(), Some("30"), "размер по умолчанию второго документа перенесён в стиль");
+        let sp = n2.child("w:pPr").unwrap().child("w:spacing").unwrap();
+        assert_eq!((sp.attr("w:after"), sp.attr("w:line")), (Some("0"), Some("240")), "интервалы первого документа нейтрализованы");
+        // все абзацы второго документа (в том числе в таблице) получают копию, абзац первого — нет
+        let ps = pstyles(&d);
+        assert_eq!(ps, [n2.attr("w:styleId").unwrap(); 2]);
+        assert_eq!(texts(d.root.child("w:body").unwrap()), ["A", "B", "cell"]);
+        // в режиме «как в Word» остаётся предупреждение
+        let (_, w) = run_base_wins(dir.path(), "dd_wins", &[&a, &b]);
+        assert!(w.iter().any(|m| m.contains("по умолчанию")), "{w:?}");
+        // одинаковые docDefaults — без копий
+        let (out, w) = run(dir.path(), "dd_same", &[&a, &a]);
+        assert!(w.is_empty());
+        assert_eq!(style_list(&doc_of(&out).0).len(), 2);
+    }
+
+    #[test]
+    fn style_numbering_restarts_in_every_document() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (numbered_doc("decimal", "x"), numbered_doc("decimal", "y"));
+        for (name, keep) in [("num_keep", true), ("num_wins", false)] {
+            let (out, w) = run_opts(dir.path(), name, &[&a, &b, &b], &Options { keep_source_styles: keep });
+            assert!(w.is_empty(), "{w:?}");
+            let (pkg, d) = doc_of(&out);
+            // стили не дублируются: список общий, но у абзацев последующих документов — собственные списки
+            assert_eq!(style_list(&pkg).len(), 3, "{name}");
+            let nums: Vec<Option<String>> = all(&d.root, "w:p").iter().map(|p| p.child("w:pPr").and_then(|x| x.child("w:numPr")).and_then(|n| n.child("w:numId")).and_then(|n| n.val()).map(String::from)).collect();
+            assert_eq!(nums.len(), 6);
+            assert_eq!(nums[0], None, "первый документ не меняется");
+            assert_eq!(nums[1], None);
+            assert!(nums[2].is_some() && nums[2] == nums[3], "{nums:?}");
+            assert!(nums[4].is_some() && nums[4] == nums[5] && nums[4] != nums[2], "{nums:?}");
+            // новые списки: тот же абстрактный список и «начать с 1» на каждом уровне
+            let n = xml::parse(pkg.get("word/numbering.xml").unwrap()).unwrap();
+            let id = nums[2].clone().unwrap();
+            let num = all(&n.root, "w:num").into_iter().find(|e| e.attr("w:numId") == Some(id.as_str())).unwrap();
+            assert_eq!(num.child("w:lvlOverride").unwrap().child("w:startOverride").unwrap().val(), Some("1"));
+            // отступ стиля сохранён явно (у абзаца с собственным списком отступ уровня списка сильнее стиля)
+            let ind = all(&d.root, "w:p")[2].child("w:pPr").unwrap().child("w:ind").unwrap().clone();
+            assert_eq!(ind.attr("w:left"), Some("720"));
+        }
+        // маркеры не нумеруются — перезапуск не нужен
+        let (a, b) = (numbered_doc("bullet", "x"), numbered_doc("bullet", "y"));
+        let (out, _) = run(dir.path(), "num_bullet", &[&a, &b]);
+        assert!(all(&doc_of(&out).1.root, "w:numPr").is_empty());
+    }
+
+    #[test]
+    fn numbered_style_conflict_brings_its_own_list() {
+        let dir = tempfile::tempdir().unwrap();
+        // у первого документа «heading 1» без нумерации, у второго — с нумерацией «Статья %1.»
+        let h = |t: &str| fx(&format!(r#"<w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>{t}</w:t></w:r></w:p>{}"#, sect("")));
+        let plain = h("P");
+        let mut numbered = h("N");
+        numbered.styles = styles_xml("").replace(r#"<w:rPr><w:b/></w:rPr>"#, r#"<w:pPr><w:numPr><w:numId w:val="1"/></w:numPr></w:pPr><w:rPr><w:b/></w:rPr>"#);
+        numbered.numbering = Some(numbering_xml("decimal").replace("%1.", "Статья %1."));
+        for (first, second) in [(&plain, &numbered), (&numbered, &plain), (&numbered, &numbered)] {
+            let (out, w) = run(dir.path(), "num_conflict", &[first, second, first]);
+            assert!(w.is_empty(), "{w:?}");
+            let (pkg, d) = doc_of(&out);
+            let styles = style_list(&pkg);
+            let numbered_style = |s: &Elem| s.child("w:pPr").and_then(|p| p.child("w:numPr")).is_some();
+            // каждый абзац ссылается на стиль, нумерация которого — как в его исходном документе
+            let ps = pstyles(&d);
+            let want = [first, second, first].map(|f| std::ptr::eq(f, &numbered));
+            for (id, want_num) in ps.iter().zip(want) {
+                let st = styles.iter().find(|s| s.attr("w:styleId") == Some(id.as_str())).unwrap();
+                let has_direct = false;
+                assert_eq!(numbered_style(st) || has_direct, want_num, "{id}: {:?}", styles.iter().map(style_name).collect::<Vec<_>>());
+            }
+        }
+    }
+
+    #[test]
+    fn linked_character_style_is_renamed_together_with_its_paragraph_style() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = |extra: &str| {
+            let mut f = fx(&format!(r#"<w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:rPr><w:rStyle w:val="H1Char"/></w:rPr><w:t>x</w:t></w:r></w:p>{}"#, sect("")));
+            f.styles = styles_xml(&format!(r#"<w:style w:type="character" w:customStyle="1" w:styleId="H1Char"><w:name w:val="Heading 1 Char"/><w:link w:val="Heading1"/>{extra}</w:style>"#))
+                .replace(r#"<w:basedOn w:val="Normal"/>"#, r#"<w:basedOn w:val="Normal"/><w:link w:val="H1Char"/>"#);
+            f
+        };
+        let a = link("<w:rPr><w:b/></w:rPr>");
+        // «Heading 1 Char» одинаков, но связанный «heading 1» отличается
+        let mut b = link("<w:rPr><w:b/></w:rPr>");
+        b.styles = b.styles.replace("<w:rPr><w:b/></w:rPr></w:style><w:style w:type=\"character\"", "<w:rPr><w:i/></w:rPr></w:style><w:style w:type=\"character\"");
+        let (out, w) = run(dir.path(), "linked", &[&a, &b]);
+        assert!(w.is_empty(), "{w:?}");
+        let (pkg, d) = doc_of(&out);
+        let styles = style_list(&pkg);
+        let h = styles.iter().find(|s| style_name(s) == "heading 1 (2)").unwrap();
+        let c = styles.iter().find(|s| style_name(s) == "Heading 1 Char (2)").expect("связанный знаковый стиль перенесён парой");
+        assert_eq!(h.child("w:link").unwrap().val(), c.attr("w:styleId"));
+        assert_eq!(c.child("w:link").unwrap().val(), h.attr("w:styleId"));
+        let rs = all(&d.root, "w:rStyle");
+        assert_eq!(rs[1].val(), c.attr("w:styleId"));
+    }
+
+    #[test]
+    fn styleref_follows_renamed_style_and_split_instructions_are_renamed() {
+        let dir = tempfile::tempdir().unwrap();
+        // закладка и поле, разбитые на несколько w:instrText, + STYLEREF на переименованный стиль
+        let mut b = fx(&format!(
+            r#"<w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:bookmarkStart w:id="0" w:name="_Toc123456789"/><w:r><w:t>T</w:t></w:r><w:bookmarkEnd w:id="0"/></w:p><w:p><w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText xml:space="preserve"> PAGEREF _Toc</w:instrText></w:r><w:r><w:instrText>123456789 \h </w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:t>1</w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r><w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText xml:space="preserve"> STYLEREF "heading 1" </w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:t>T</w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r></w:p>{}"#,
+            sect("")
+        ));
+        b.styles = styles_xml("").replace("<w:b/>", "<w:i/>");
+        // у первого документа та же закладка
+        let a = fx(&format!(r#"<w:p><w:bookmarkStart w:id="0" w:name="_Toc123456789"/><w:r><w:t>A</w:t></w:r><w:bookmarkEnd w:id="0"/></w:p>{}"#, sect("")));
+        let (out, _) = run(dir.path(), "fields", &[&a, &b]);
+        let (_, d) = doc_of(&out);
+        let instr: Vec<String> = all(&d.root, "w:instrText").iter().map(|e| e.text()).collect();
+        assert_eq!(instr.iter().filter(|t| t.trim().is_empty()).count(), 0, "лишние пустые фрагменты удалены: {instr:?}");
+        assert!(instr[0].contains("PAGEREF _Toc123456789_m1 \\h"), "{instr:?}");
+        assert!(instr[1].contains("STYLEREF \"heading 1 (2)\""), "{instr:?}");
+        let names: Vec<String> = all(&d.root, "w:bookmarkStart").iter().map(|e| e.attr("w:name").unwrap().to_string()).collect();
+        assert_eq!(names, ["_Toc123456789", "_Toc123456789_m1"]);
+    }
+
+    #[test]
+    fn toc_fields_in_appended_documents_are_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = fx(&format!("{}{}", para("A"), sect("")));
+        let toc = |instr: &str| {
+            fx(&format!(
+                r#"<w:p><w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText xml:space="preserve"> TOC \o "1-3" </w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:t>1</w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r></w:p><w:fldSimple w:instr="{instr}"><w:r><w:t>x</w:t></w:r></w:fldSimple>{}"#,
+                sect("")
+            ))
+        };
+        let (_, w) = run(dir.path(), "toc", &[&a, &toc(" PAGE ")]);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("F9") && w[0].contains("оглавлен"));
+        // у первого документа оглавление остаётся верным — предупреждения нет
+        let (_, w) = run(dir.path(), "toc_first", &[&toc(" PAGE "), &a]);
+        assert!(w.is_empty(), "{w:?}");
+    }
+
+    fn settings_part(f: Fx, extra: &str) -> Fx {
+        f.part("word/settings.xml", format!(r#"<w:settings xmlns:w="{WNS}">{extra}</w:settings>"#))
+            .rel("rS", "settings", "settings.xml")
+            .ct("/word/settings.xml", &format!("{CT_NOTES}settings+xml"))
+    }
+
+    fn with_header(f: Fx, text: &str) -> Fx {
+        f.part("word/hdr.xml", hdr("w:hdr", text))
+            .rel("rH", "header", "hdr.xml")
+            .ct("/word/hdr.xml", &format!("{CT_NOTES}header+xml"))
+            .part("word/ftr.xml", hdr("w:ftr", &format!("{text}-F")))
+            .rel("rF", "footer", "ftr.xml")
+            .ct("/word/ftr.xml", &format!("{CT_NOTES}footer+xml"))
+    }
+
+    fn sect_hf() -> String {
+        sect(r#"<w:headerReference w:type="default" r:id="rH"/><w:footerReference w:type="default" r:id="rF"/>"#)
+    }
+
+    #[test]
+    fn even_odd_headers_are_shared_by_all_documents() {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = with_header(fx(&format!("{}{}", para("P"), sect_hf())), "HDR-P");
+        let even = settings_part(with_header(fx(&format!("{}{}", para("E"), sect_hf())), "HDR-E"), "<w:evenAndOddHeaders/>");
+        for (name, docs) in [("eo_later", [&even, &plain]), ("eo_first", [&plain, &even])] {
+            let (out, w) = run(dir.path(), name, &docs);
+            assert!(!w.iter().any(|m| m.contains("чётных")), "{w:?}");
+            let (pkg, d) = doc_of(&out);
+            let settings = xml::parse(pkg.get("word/settings.xml").unwrap()).unwrap();
+            assert!(setting_on(&settings.root, "w:evenAndOddHeaders"), "{name}");
+            // у документа без настройки чётная страница показывает его обычный колонтитул и нижний колонтитул
+            let sects = all(&d.root, "w:sectPr");
+            let plain_idx = if name == "eo_later" { 1 } else { 0 };
+            let sp = &sects[plain_idx];
+            for tag in ["w:headerReference", "w:footerReference"] {
+                let get = |ty: &str| sp.elems().find(|e| e.name == tag && e.attr("w:type").unwrap_or("default") == ty).and_then(|e| e.attr("r:id")).map(String::from);
+                assert!(get("even").is_some() && get("even") == get("default"), "{name}: {tag}");
+            }
+            // у документа с настройкой чётный колонтитул не берётся у соседнего документа
+            let other = &sects[1 - plain_idx];
+            let ev = |s: &Elem| s.elems().find(|e| e.name == "w:headerReference" && e.attr("w:type") == Some("even")).and_then(|e| e.attr("r:id")).map(String::from);
+            assert!(ev(other).is_none() || ev(other) != ev(sp), "{name}");
+        }
+        // настройка есть у всех — ничего не добавляется
+        let (out, _) = run(dir.path(), "eo_all", &[&even, &even]);
+        let (_, d) = doc_of(&out);
+        assert!(all(&d.root, "w:headerReference").iter().all(|e| e.attr("w:type") == Some("default")));
+    }
+
+    #[test]
+    fn page_background_difference_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        // w:background — дочерний элемент w:document перед w:body
+        let write_bg = |dir: &Path, name: &str, color: Option<&str>| {
+            let f = fx(&format!("{}{}", para("A"), sect("")));
+            let p = dir.join(name);
+            f.write(&p);
+            let mut pkg = Pkg::read(&p).unwrap();
+            let doc = String::from_utf8(pkg.get("word/document.xml").unwrap().to_vec()).unwrap();
+            let doc = match color {
+                Some(c) => doc.replace("<w:body>", &format!(r#"<w:background w:color="{c}"/><w:body>"#)),
+                None => doc,
+            };
+            pkg.set("word/document.xml", doc.into_bytes());
+            pkg.write(&p).unwrap();
+            p
+        };
+        let (plain, yellow, blue) = (write_bg(dir.path(), "p.docx", None), write_bg(dir.path(), "y.docx", Some("FFF2CC")), write_bg(dir.path(), "b.docx", Some("0000FF")));
+        let out = dir.path().join("o.docx");
+        let o = Options::default();
+        let w = merge(&[plain.clone(), yellow.clone()], &out, &o).unwrap();
+        assert!(w.iter().any(|m| m.contains("фон страницы") && m.contains("не перенесён")), "{w:?}");
+        let w = merge(&[yellow.clone(), plain.clone()], &out, &o).unwrap();
+        assert!(w.iter().any(|m| m.contains("фон страницы") && m.contains("применён")), "{w:?}");
+        let w = merge(&[yellow.clone(), blue], &out, &o).unwrap();
+        assert!(w.iter().any(|m| m.contains("фон страницы") && m.contains("отличается")), "{w:?}");
+        assert!(String::from_utf8_lossy(Pkg::read(&out).unwrap().get("word/document.xml").unwrap()).contains("FFF2CC"));
+        assert!(merge(&[yellow.clone(), yellow], &out, &o).unwrap().is_empty());
+    }
+
+    #[test]
+    fn default_namespace_and_utf16_parts_are_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = fx(&format!("{}{}", para("A"), sect("")));
+        // пространство имён по умолчанию + атрибуты с вложенным объявлением (как делает ElementTree)
+        let pd = dir.path().join("d.docx");
+        fx("").write(&pd);
+        let mut pkg = Pkg::read(&pd).unwrap();
+        pkg.set(
+            "word/document.xml",
+            format!(r#"<?xml version="1.0"?><document xmlns="{WNS}" xmlns:rel="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><body xmlns:ns0="{WNS}"><p><pPr><pStyle ns0:val="Heading1"/></pPr><r><t>DEF</t></r></p><sectPr><pgSz ns0:w="1" ns0:h="2"/></sectPr></body></document>"#).into_bytes(),
+        );
+        pkg.write(&pd).unwrap();
+        // UTF-16 с BOM (LE) и без BOM (BE)
+        let utf16 = |s: &str, be: bool, bom: bool| {
+            let mut v = vec![];
+            if bom {
+                v.extend(if be { [0xFE, 0xFF] } else { [0xFF, 0xFE] });
+            }
+            for u in s.encode_utf16() {
+                v.extend(if be { u.to_be_bytes() } else { u.to_le_bytes() });
+            }
+            v
+        };
+        let mk16 = |name: &str, be: bool, bom: bool| {
+            let f = fx(&format!("{}{}", para("Юникод"), sect("")));
+            let p = dir.path().join(name);
+            f.write(&p);
+            let mut pkg = Pkg::read(&p).unwrap();
+            for part in ["word/document.xml", "word/styles.xml", "word/_rels/document.xml.rels", "[Content_Types].xml"] {
+                let text = String::from_utf8(pkg.get(part).unwrap().to_vec()).unwrap();
+                pkg.set(part, utf16(&text, be, bom));
+            }
+            pkg.write(&p).unwrap();
+            p
+        };
+        let out = dir.path().join("o.docx");
+        for (n, p) in [("def", pd), ("u16le", mk16("le.docx", false, true)), ("u16be", mk16("be.docx", true, false))] {
+            let pa = dir.path().join("a.docx");
+            a.write(&pa);
+            merge(&[pa, p], &out, &Options::default()).unwrap_or_else(|e| panic!("{n}: {e:#}"));
+            let errs = check(&out);
+            assert!(errs.is_empty(), "{n}: {errs:#?}");
+            let (_, d) = doc_of(&out);
+            let t = texts(d.root.child("w:body").unwrap());
+            assert_eq!(t.len(), 2, "{n}");
+            assert!(t[1] == "DEF" || t[1] == "Юникод", "{t:?}");
+        }
+        // результат всегда в UTF-8
+        assert!(Pkg::read(&out).unwrap().get("word/document.xml").unwrap().starts_with(b"<?xml"));
+    }
+
+    #[test]
+    fn malformed_xml_is_rejected_with_a_clear_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = fx(&format!("{}{}", para("A"), sect("")));
+        let pa = dir.path().join("a.docx");
+        a.write(&pa);
+        let out = dir.path().join("o.docx");
+        let bad = |name: &str, part: &str, f: &dyn Fn(String) -> Vec<u8>| {
+            let p = dir.path().join(name);
+            fx(&format!("{}{}", para("B &amp; C"), sect(""))).write(&p);
+            let mut pkg = Pkg::read(&p).unwrap();
+            let text = String::from_utf8(pkg.get(part).unwrap().to_vec()).unwrap();
+            pkg.set(part, f(text));
+            pkg.write(&p).unwrap();
+            p
+        };
+        let cases: Vec<(&str, PathBuf, &str)> = vec![
+            ("амперсанд", bad("amp.docx", "word/document.xml", &|t| t.replace("B &amp; C", "B & C").into_bytes()), "&amp;"),
+            ("ссылка на символ", bad("ref.docx", "word/styles.xml", &|t| t.replace("<w:b/>", "<w:b/>&#x0;").into_bytes()), "недопустим"),
+            ("обрыв", bad("cut.docx", "word/document.xml", &|t| t[..t.len() / 2].as_bytes().to_vec()), "обрезан"),
+            (
+                "обрыв на символе",
+                bad("cut2.docx", "word/document.xml", &|t| {
+                    let mut v = t[..t.find("B &amp; C").unwrap()].as_bytes().to_vec();
+                    v.push(0xD0);
+                    v
+                }),
+                "обрезан",
+            ),
+            (
+                "не UTF-8",
+                bad("enc.docx", "word/document.xml", &|t| {
+                    let mut v = t.into_bytes();
+                    let i = v.windows(9).position(|w| w == b"B &amp; C").unwrap();
+                    v[i] = 0xE9;
+                    v
+                }),
+                "UTF-8",
+            ),
+            ("префикс", bad("pfx.docx", "word/document.xml", &|t| t.replace("<w:t>", "<q:t>").replace("</w:t>", "</q:t>").into_bytes()), "не объявлен"),
+            ("повтор атрибута", bad("dup.docx", "word/document.xml", &|t| t.replace("<w:t>", r#"<w:t a="1" a="2">"#).into_bytes()), "повторяется"),
+        ];
+        for (what, p, key) in cases {
+            let e = merge(&[pa.clone(), p.clone()], &out, &Options::default()).unwrap_err();
+            let msg = format!("{e:#}");
+            assert!(msg.contains(&p.file_name().unwrap().to_string_lossy().to_string()), "{what}: нет имени файла: {msg}");
+            assert!(msg.contains(key), "{what}: {msg}");
+            assert!(!msg.contains("UTF-8") || what == "не UTF-8", "{what}: обрыв нельзя выдавать за кодировку: {msg}");
+            assert!(!msg.chars().any(|c| c.is_ascii_alphabetic()) || msg.contains("«") , "{msg}");
+        }
+    }
+
+    #[test]
+    fn damaged_archives_are_described_in_russian() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = fx(&format!("{}{}", para("A"), sect("")));
+        let pa = dir.path().join("a.docx");
+        a.write(&pa);
+        let out = dir.path().join("o.docx");
+        let full = std::fs::read(&pa).unwrap();
+        let cases: Vec<(&str, Vec<u8>, &str)> = vec![
+            ("обрезан", full[..full.len() / 2].to_vec(), "обрезан"),
+            ("не zip", b"just some text, not an archive".to_vec(), "повреждён"),
+            ("пустой", vec![], "повреждён"),
+        ];
+        for (what, bytes, key) in cases {
+            let p = dir.path().join(format!("{what}.docx"));
+            std::fs::write(&p, bytes).unwrap();
+            let msg = format!("{:#}", merge(&[pa.clone(), p], &out, &Options::default()).unwrap_err());
+            assert!(msg.contains(key) && msg.contains(".docx"), "{what}: {msg}");
+            for raw in ["invalid Zip", "Could not find", "os error", "Os {", "Error {"] {
+                assert!(!msg.contains(raw), "{what}: сырой текст библиотеки: {msg}");
+            }
+        }
+        // отсутствующий файл
+        let msg = format!("{:#}", merge(&[pa.clone(), dir.path().join("нет.docx")], &out, &Options::default()).unwrap_err());
+        assert!(msg.contains("нет.docx") && msg.contains("не найден") && !msg.contains("os error"), "{msg}");
+        // повреждённая контрольная сумма записи
+        let mut broken = full.clone();
+        let pos = broken.windows(4).position(|w| w == b"PK\x03\x04").unwrap();
+        let data_start = pos + 30 + u16::from_le_bytes([broken[pos + 26], broken[pos + 27]]) as usize + u16::from_le_bytes([broken[pos + 28], broken[pos + 29]]) as usize;
+        for b in broken[data_start..data_start + 8].iter_mut() {
+            *b ^= 0xFF;
+        }
+        let p = dir.path().join("crc.docx");
+        std::fs::write(&p, broken).unwrap();
+        let msg = format!("{:#}", merge(&[pa, p], &out, &Options::default()).unwrap_err());
+        assert!(msg.contains("crc.docx") && msg.contains("повреждён"), "{msg}");
+        assert!(!msg.contains("checksum") && !msg.contains("deflate"), "{msg}");
+    }
+
+    #[test]
+    fn xml_decode_handles_bom_and_utf16() {
+        assert_eq!(xml::decode(b"\xEF\xBB\xBF<a/>").unwrap(), "<a/>");
+        assert_eq!(xml::decode(&[0xFF, 0xFE, b'<', 0, b'a', 0, b'/', 0, b'>', 0]).unwrap(), "<a/>");
+        assert_eq!(xml::decode(&[0, b'<', 0, b'a', 0, b'/', 0, b'>']).unwrap(), "<a/>");
+        assert!(xml::decode(&[0xFF, 0xFE, b'<']).is_err());
+        assert!(xml::parse("<a b=\"1\" c='&#1;'/>".as_bytes()).is_err());
+        assert!(xml::parse("<a>&#x41;&lt;&#65;</a>".as_bytes()).is_ok());
+        assert!(xml::parse("<a>a &b; c</a>".as_bytes()).is_err());
+        assert!(xml::parse("<a b=\"x<y\"/>".as_bytes()).is_err());
+    }
+
+    fn theme_xml(accent: &str, minor: &str) -> String {
+        format!(
+            r#"<a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:themeElements><a:clrScheme name="x"><a:dk1><a:sysClr val="windowText" lastClr="000000"/></a:dk1><a:lt1><a:sysClr val="window" lastClr="FFFFFF"/></a:lt1><a:accent1><a:srgbClr val="{accent}"/></a:accent1></a:clrScheme><a:fontScheme name="y"><a:majorFont><a:latin typeface="Major{minor}"/><a:ea typeface=""/><a:cs typeface=""/></a:majorFont><a:minorFont><a:latin typeface="{minor}"/><a:ea typeface=""/><a:cs typeface=""/></a:minorFont></a:fontScheme></a:themeElements></a:theme>"#
+        )
+    }
+
+    fn with_theme(f: Fx, accent: &str, minor: &str) -> Fx {
+        f.part("word/theme/theme1.xml", theme_xml(accent, minor))
+            .rel("rT", "theme", "theme/theme1.xml")
+            .ct("/word/theme/theme1.xml", "application/vnd.openxmlformats-officedocument.theme+xml")
+    }
+
+    #[test]
+    fn theme_fonts_and_colors_are_made_explicit_when_themes_differ() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = |t: &str| {
+            format!(
+                r#"<w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:rPr><w:color w:val="auto" w:themeColor="accent1"/><w:rFonts w:asciiTheme="minorHAnsi" w:ascii="Arial"/></w:rPr><w:t>{t}</w:t></w:r></w:p><w:p><w:r><w:drawing><wp:inline><wp:docPr id="1" name="s"/><a:graphic><a:graphicData uri="u"><a:solidFill><a:schemeClr val="accent1"><a:lumMod val="50000"/></a:schemeClr></a:solidFill></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>{}"#,
+                sect("")
+            )
+        };
+        let styles = |extra: &str| styles_xml("").replace("<w:sz w:val=\"22\"/>", &format!("<w:rFonts w:asciiTheme=\"minorHAnsi\"/><w:sz w:val=\"22\"/>{extra}"));
+        let mut a = with_theme(fx(&body("A")), "FF0000", "Calibri");
+        a.styles = styles("");
+        let mut b = with_theme(fx(&body("B")), "00FF00", "Cambria");
+        b.styles = styles("");
+        let (out, w) = run(dir.path(), "theme_keep", &[&a, &b]);
+        assert!(w.is_empty(), "{w:?}");
+        let (pkg, d) = doc_of(&out);
+        // первый документ не тронут, у второго цвет темы стал явным, шрифт темы — названием шрифта
+        let runs: Vec<Elem> = all(&d.root, "w:rPr").into_iter().filter(|r| r.child("w:color").is_some()).collect();
+        assert_eq!(runs[0].child("w:color").unwrap().attr("w:themeColor"), Some("accent1"));
+        let c = runs[1].child("w:color").unwrap();
+        assert_eq!((c.val(), c.attr("w:themeColor")), (Some("00FF00"), None));
+        let f = runs[1].child("w:rFonts").unwrap();
+        assert_eq!((f.attr("w:ascii"), f.attr("w:asciiTheme")), (Some("Cambria"), None));
+        // DrawingML: цвет схемы заменён на RGB с теми же преобразованиями
+        let clr = all(&d.root, "a:srgbClr");
+        assert_eq!(clr.len(), 1);
+        assert_eq!(clr[0].val(), None);
+        assert_eq!(clr[0].attr("val"), Some("00FF00"));
+        assert!(clr[0].child("a:lumMod").is_some());
+        assert_eq!(all(&d.root, "a:schemeClr").len(), 1, "у первого документа цвет схемы остаётся");
+        // стиль по умолчанию второго документа: шрифт темы стал явным
+        let styles = style_list(&pkg);
+        let n2 = styles.iter().find(|s| style_name(s) == "Normal (2)").expect("копия Normal");
+        let f = n2.child("w:rPr").unwrap().child("w:rFonts").unwrap();
+        assert_eq!((f.attr("w:ascii"), f.attr("w:asciiTheme")), (Some("Cambria"), None));
+        // одинаковая тема — ничего не заменяется и стили не дублируются
+        let b2 = with_theme(fx(&body("B")), "FF0000", "Calibri");
+        let mut b2 = b2;
+        b2.styles = styles_xml("").replace("<w:sz w:val=\"22\"/>", "<w:rFonts w:asciiTheme=\"minorHAnsi\"/><w:sz w:val=\"22\"/>");
+        let (out, w) = run(dir.path(), "theme_same", &[&a, &b2]);
+        assert!(w.is_empty());
+        assert_eq!(all(&doc_of(&out).1.root, "a:schemeClr").len(), 2);
+        assert_eq!(style_list(&doc_of(&out).0).len(), 2);
+    }
+
+    #[test]
+    fn table_cell_paragraphs_keep_table_style_over_pushed_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let table_style = r#"<w:style w:type="table" w:styleId="TableGrid"><w:name w:val="Table Grid"/><w:pPr><w:spacing w:after="0" w:line="240" w:lineRule="auto"/></w:pPr></w:style>"#;
+        let a = fx(&format!("{}{}", para("A"), sect("")));
+        let mut b = fx(&format!(
+            r#"{}<w:tbl><w:tblPr><w:tblStyle w:val="TableGrid"/></w:tblPr><w:tr><w:tc><w:p><w:r><w:t>cell</w:t></w:r></w:p><w:p><w:pPr><w:pStyle w:val="Normal"/></w:pPr><w:r><w:t>n</w:t></w:r></w:p><w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>h</w:t></w:r></w:p></w:tc></w:tr></w:tbl>{}"#,
+            para("B"),
+            sect("")
+        ));
+        b.styles = styles_xml(table_style).replace("</w:rPrDefault>", r#"</w:rPrDefault><w:pPrDefault><w:pPr><w:spacing w:after="100" w:line="300" w:lineRule="auto"/><w:jc w:val="both"/></w:pPr></w:pPrDefault>"#);
+        let (out, w) = run(dir.path(), "cells", &[&a, &b]);
+        assert!(w.is_empty(), "{w:?}");
+        let (pkg, d) = doc_of(&out);
+        let styles = style_list(&pkg);
+        let n2 = styles.iter().find(|s| style_name(s) == "Normal (2)").unwrap();
+        let cell = styles.iter().find(|s| style_name(s) == "Normal в таблице (2)").expect("копия для ячеек");
+        let sp = |s: &Elem| s.child("w:pPr").and_then(|p| p.child("w:spacing")).map(|e| (e.attr("w:after").map(String::from), e.attr("w:line").map(String::from)));
+        // у обычного абзаца — интервалы docDefaults, у абзаца в ячейке — только то, чего стиль таблицы не задаёт
+        assert_eq!(sp(n2), Some((Some("100".into()), Some("300".into()))));
+        assert_eq!(sp(cell), None, "и after, и line, и lineRule заданы стилем таблицы: {:?}", cell.child("w:pPr"));
+        assert!(cell.child("w:pPr").unwrap().child("w:jc").is_some(), "выравнивание стиль таблицы не задаёт — переносится");
+        let ps = pstyles(&d);
+        let (n2id, cid) = (n2.attr("w:styleId").unwrap(), cell.attr("w:styleId").unwrap());
+        // абзац без стиля и с явным «Normal» в ячейке — копия для ячеек; заголовок — своя копия; вне таблицы — копия Normal
+        assert_eq!(ps[0], n2id);
+        assert_eq!(&ps[1..3], [cid, cid]);
+        assert_ne!(ps[3], cid);
+        assert!(all(&d.root, "w:p").iter().all(|p| p.attr("mf:cell").is_none()));
+    }
+
+    #[test]
+    fn style_with_missing_parent_or_default_is_handled() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = fx(&format!("{}{}", para("A"), sect("")));
+        // у второго документа нет стиля «по умолчанию», а docDefaults отличаются; стиль ссылается на несуществующий
+        let mut b = fx(&format!(r#"{}<w:p><w:pPr><w:pStyle w:val="X"/></w:pPr><w:r><w:t>x</w:t></w:r></w:p>{}"#, para("B"), sect("")));
+        b.styles = format!(
+            r#"<?xml version="1.0"?><w:styles xmlns:w="{WNS}"><w:docDefaults><w:rPrDefault><w:rPr><w:sz w:val="40"/></w:rPr></w:rPrDefault></w:docDefaults><w:style w:type="paragraph" w:styleId="X"><w:name w:val="X"/><w:basedOn w:val="Gone"/><w:next w:val="Gone"/><w:link w:val="Gone"/></w:style></w:styles>"#
+        );
+        let (out, w) = run(dir.path(), "nodef", &[&a, &b]);
+        assert!(w.is_empty(), "{w:?}");
+        let (pkg, d) = doc_of(&out);
+        let styles = style_list(&pkg);
+        let x = styles.iter().find(|s| style_name(s) == "X").unwrap();
+        assert!(x.child("w:basedOn").is_none() && x.child("w:next").is_none() && x.child("w:link").is_none());
+        // абзацы без стиля получили созданный «обычный» стиль с размером шрифта второго документа
+        let n2 = styles.iter().find(|s| style_name(s) == "Normal (2)").expect("созданный стиль");
+        assert_eq!(n2.child("w:rPr").unwrap().child("w:sz").unwrap().val(), Some("40"));
+        let ps = pstyles(&d);
+        assert_eq!(ps, [n2.attr("w:styleId").unwrap(), "X"]);
+    }
+
+    #[test]
+    fn title_page_without_own_first_footer_stays_blank() {
+        let dir = tempfile::tempdir().unwrap();
+        // у первого документа есть колонтитул «по умолчанию», у второго — особая первая страница только с верхним
+        let a = with_header(fx(&format!("{}{}", para("A"), sect_hf())), "HDR-A");
+        let b = with_header(fx(&format!("{}{}", para("B"), sect(r#"<w:headerReference w:type="first" r:id="rH"/><w:titlePg/>"#))), "HDR-B");
+        let (out, _) = run(dir.path(), "titlepg", &[&a, &b]);
+        let (pkg, d) = doc_of(&out);
+        let last = d.root.child("w:body").unwrap().child("w:sectPr").unwrap().clone();
+        let r = |tag: &str, ty: &str| last.elems().find(|e| e.name == tag && e.attr("w:type") == Some(ty)).and_then(|e| e.attr("r:id")).map(String::from);
+        let rels = Rels::parse(pkg.get("word/_rels/document.xml.rels").unwrap()).unwrap();
+        // нижний колонтитул первой страницы — пустой, а не колонтитул предыдущего документа
+        let f = r("w:footerReference", "first").expect("ссылка на пустой нижний колонтитул первой страницы");
+        let target = resolve_part(&pkg, "word/document.xml", &rels.get(&f).unwrap().target).unwrap();
+        assert!(!String::from_utf8_lossy(pkg.get(&target).unwrap()).contains("HDR-A"));
+        // обычные колонтитулы предыдущего документа тоже не наследуются
+        assert!(r("w:headerReference", "default").is_some() && r("w:footerReference", "default").is_some());
+    }
+
+    #[test]
+    fn compatibility_mode_difference_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let compat = |mode: &str, extra: &str| {
+            settings_part(
+                fx(&format!("{}{}", para("P"), sect(""))),
+                &format!(r#"<w:compat>{extra}<w:compatSetting w:name="compatibilityMode" w:uri="http://schemas.microsoft.com/office/word" w:val="{mode}"/></w:compat>"#),
+            )
+        };
+        let (_, w) = run(dir.path(), "compat_same", &[&compat("15", ""), &compat("15", "")]);
+        assert!(w.is_empty(), "{w:?}");
+        let (_, w) = run(dir.path(), "compat_mode", &[&compat("15", ""), &compat("14", "")]);
+        assert!(w.iter().any(|m| m.contains("режим совместимости")), "{w:?}");
+        let (_, w) = run(dir.path(), "compat_flag", &[&compat("15", ""), &compat("15", "<w:usePrinterMetrics/>")]);
+        assert!(w.iter().any(|m| m.contains("режим совместимости")), "{w:?}");
+    }
+
+    #[test]
+    fn remerging_an_output_with_renamed_styles_keeps_every_look() {
+        let dir = tempfile::tempdir().unwrap();
+        // три документа с разным «Normal»; результат слияния двух снова входит в слияние (id вида Normal_m1 уже заняты)
+        let mk = |t: &str, prop: &str| {
+            let mut f = fx(&format!("{}{}", para(t), sect("")));
+            f.styles = styles_xml("").replace(r#"<w:name w:val="Normal"/></w:style>"#, &format!(r#"<w:name w:val="Normal"/><w:rPr><{prop}/></w:rPr></w:style>"#));
+            f
+        };
+        let (x, y, z) = (mk("X", "w:b"), mk("Y", "w:i"), mk("Z", "w:u"));
+        let (xy, _) = run(dir.path(), "re_xy", &[&x, &y]);
+        let zp = dir.path().join("z.docx");
+        z.write(&zp);
+        for order in [[zp.clone(), xy.clone()], [xy.clone(), zp.clone()]] {
+            let out = dir.path().join("re_out.docx");
+            merge(&order, &out, &Options::default()).unwrap();
+            let errs = check(&out);
+            assert!(errs.is_empty(), "{errs:#?}");
+            let (pkg, d) = doc_of(&out);
+            let styles = style_list(&pkg);
+            let default_id = styles.iter().find(|s| s.attr("w:default") == Some("1")).and_then(|s| s.attr("w:styleId")).unwrap().to_string();
+            let look: HashMap<String, String> = all(d.root.child("w:body").unwrap(), "w:p")
+                .iter()
+                .map(|p| {
+                    let sid = p.child("w:pPr").and_then(|x| x.child("w:pStyle")).and_then(|s| s.val()).map(String::from).unwrap_or(default_id.clone());
+                    let st = styles.iter().find(|s| s.attr("w:styleId") == Some(sid.as_str())).unwrap();
+                    (texts(p).concat(), st.child("w:rPr").unwrap().elems().next().unwrap().name.clone())
+                })
+                .collect();
+            assert_eq!(look["X"], "w:b");
+            assert_eq!(look["Y"], "w:i");
+            assert_eq!(look["Z"], "w:u");
+        }
+    }
+
+    #[test]
+    fn normal_without_default_flag_is_the_default_paragraph_style() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = fx(&format!("{}{}", para("A"), sect("")));
+        // как у LibreOffice: «Normal» без w:default, абзац без стиля получает именно его
+        let mut b = fx(&format!("{}{}", para("B"), sect("")));
+        b.styles = styles_xml("")
+            .replace(r#" w:default="1" w:styleId="Normal""#, r#" w:styleId="Normal""#)
+            .replace(r#"<w:name w:val="Normal"/></w:style>"#, r#"<w:name w:val="Normal"/><w:rPr><w:sz w:val="40"/></w:rPr></w:style>"#);
+        let (out, w) = run(dir.path(), "lo_normal", &[&a, &b]);
+        assert!(w.is_empty(), "{w:?}");
+        let (pkg, d) = doc_of(&out);
+        let styles = style_list(&pkg);
+        let n2 = styles.iter().find(|s| style_name(s) == "Normal (2)").expect("копия Normal");
+        assert_eq!(n2.child("w:rPr").unwrap().child("w:sz").unwrap().val(), Some("40"));
+        assert_eq!(pstyles(&d), [n2.attr("w:styleId").unwrap()]);
+        // стиль по умолчанию у результата остаётся один
+        assert_eq!(styles.iter().filter(|s| s.attr("w:default") == Some("1")).count(), 1);
+    }
+
+    #[test]
+    fn document_without_any_default_style_does_not_inherit_the_base_normal() {
+        let dir = tempfile::tempdir().unwrap();
+        // у первого документа «Normal» с размером 30; у второго стилей абзаца «по умолчанию» нет вообще
+        let mut a = fx(&format!("{}{}", para("A"), sect("")));
+        a.styles = styles_xml("").replace(r#"<w:name w:val="Normal"/></w:style>"#, r#"<w:name w:val="Normal"/><w:rPr><w:sz w:val="30"/></w:rPr></w:style>"#);
+        let mut b = fx(&format!("{}{}", para("B"), sect("")));
+        b.styles = styles_xml("").replace(r#"<w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/></w:style>"#, "");
+        let (out, w) = run(dir.path(), "nodefault", &[&a, &b]);
+        assert!(w.is_empty(), "{w:?}");
+        let (pkg, d) = doc_of(&out);
+        let styles = style_list(&pkg);
+        let ps = pstyles(&d);
+        assert_eq!(ps.len(), 1, "абзац второго документа получил пустой стиль, а не «Normal» первого");
+        let own = styles.iter().find(|s| s.attr("w:styleId") == Some(ps[0].as_str())).unwrap();
+        assert!(own.child("w:rPr").is_none_or(|r| r.child("w:sz").is_none()), "{own:?}");
     }
 }

@@ -87,7 +87,10 @@ pub fn sniff(path: &Path) -> Result<Sniffed> {
     let mut head = [0u8; 8];
     let n = f.read(&mut head)?;
     if n >= 4 && head[..4] == *b"PK\x03\x04" {
-        let Ok(zip) = zip::ZipArchive::new(std::fs::File::open(path)?) else { return Ok(Sniffed::Unknown) };
+        // Файл начинается как zip, но архив не читается: он повреждён или обрезан (а не «другого формата»).
+        let zip = zip::ZipArchive::new(std::fs::File::open(path)?).map_err(|_| {
+            anyhow!("«{}»: файл повреждён или обрезан — архив не удаётся прочитать", path.file_name().unwrap_or_default().to_string_lossy())
+        })?;
         let names: Vec<String> = zip.file_names().filter_map(Result::ok).map(|c| c.into_owned()).collect();
         let has = |n: &str| names.iter().any(|x| x == n);
         return Ok(if has("xl/workbook.xml") {
