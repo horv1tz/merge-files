@@ -390,7 +390,7 @@ impl eframe::App for App {
                 if !self.warnings.is_empty() {
                     ui.add_space(4.0);
                     egui::CollapsingHeader::new(RichText::new(format!("⚠ Предупреждения ({})", self.warnings.len())).strong())
-                        .default_open(true)
+                        .default_open(self.warnings.len() <= 3)
                         .show(ui, |ui| {
                             for w in &self.warnings {
                                 ui.add(egui::Label::new(format!("• {w}")).wrap());
