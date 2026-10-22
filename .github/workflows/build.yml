@@ -2,13 +2,13 @@ name: Build
 
 on:
   push:
-    branches: ["**"]
+    branches: [main, master, "claude/**"]
     tags: ["v*"]
   pull_request:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   windows:
@@ -17,24 +17,41 @@ jobs:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
       - name: Test
-        run: cargo test --release
+        run: cargo test --release --locked
       - name: Build
-        run: cargo build --release
+        run: cargo build --release --locked
+      - name: Check exe resources
+        shell: pwsh
+        run: |
+          $f = Get-Item target/release/merge-files.exe
+          Write-Host "size: $($f.Length) bytes; product: $($f.VersionInfo.ProductName); version: $($f.VersionInfo.FileVersion)"
+          if ($f.VersionInfo.ProductName -ne 'Merge Files') { throw 'Windows resources (icon/version) were not embedded' }
       - name: Package
         shell: pwsh
         run: |
           New-Item -ItemType Directory dist | Out-Null
           Copy-Item target/release/merge-files.exe dist/
-          Copy-Item README.md dist/
+          Copy-Item README.md, LICENSE dist/
           Compress-Archive -Path dist/* -DestinationPath merge-files-windows-x64.zip
       - uses: actions/upload-artifact@v4
         with:
           name: merge-files-windows-x64
-          path: |
-            merge-files-windows-x64.zip
-            target/release/merge-files.exe
-      - name: Publish release
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: windows
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: merge-files-windows-x64
+          path: dist
+      - name: Zip
+        run: cd dist && zip -r ../merge-files-windows-x64.zip .
+      - uses: softprops/action-gh-release@v2
         with:
           files: merge-files-windows-x64.zip

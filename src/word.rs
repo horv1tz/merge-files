@@ -61,14 +61,15 @@ impl Docx {
     }
 }
 
-pub fn merge(inputs: &[PathBuf], out: &Path) -> Result<()> {
+pub fn merge(inputs: &[PathBuf], out: &Path) -> Result<Vec<String>> {
     let (first, rest) = inputs.split_first().ok_or_else(|| anyhow!("нет файлов"))?;
     let mut base = Docx::read(first)?;
     for (i, p) in rest.iter().enumerate() {
         let other = Docx::read(p)?;
         append(&mut base, &other, i + 1).with_context(|| format!("при добавлении {}", p.display()))?;
     }
-    base.write(out)
+    base.write(out)?;
+    Ok(vec![])
 }
 
 /// Позиции содержимого `<w:body>`: (начало, конец до финального sectPr).

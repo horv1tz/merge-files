@@ -3,16 +3,20 @@
 //! Проводник запускает команду меню отдельно для каждого выделенного файла, поэтому
 //! первый запущенный экземпляр слушает локальный порт, а остальные передают ему свои
 //! пути и завершаются — все выбранные файлы оказываются в одном окне.
+//! Протокол: клиент шлёт строку-заголовок и пути (по одному в строке), закрывает запись
+//! и ждёт ответ `OK`; без ответа файлы считаются не доставленными.
 
 use anyhow::{Result, bail};
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::path::PathBuf;
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
 const ADDR: &str = "127.0.0.1:47831";
+const MAGIC: &str = "MERGE-FILES-1";
 const MENU_KEY: &str = "MergeFiles";
+pub const MENU_LABEL: &str = "Объединить файлы…";
 pub const EXTS: [&str; 6] = ["xlsx", "xlsm", "xls", "ods", "docx", "doc"];
 
 pub enum Role {
@@ -34,30 +38,58 @@ pub fn claim(paths: &[PathBuf]) -> Role {
         if paths.is_empty() {
             return Role::Standalone;
         }
-        if let Ok(mut s) = TcpStream::connect_timeout(&addr, Duration::from_millis(200)) {
-            let text: String = paths.iter().map(|p| format!("{}\n", p.display())).collect();
-            if s.write_all(text.as_bytes()).is_ok() {
-                return Role::Forwarded;
-            }
+        match forward(&addr, paths) {
+            Forward::Delivered => return Role::Forwarded,
+            // Порт занят чужой программой (или зависшим экземпляром) — не ждём впустую.
+            Forward::Foreign => return Role::Standalone,
+            Forward::Refused => {}
         }
         std::thread::sleep(Duration::from_millis(50));
     }
     Role::Standalone
 }
 
+enum Forward {
+    Delivered,
+    /// Подключиться не удалось (экземпляр ещё не слушает).
+    Refused,
+    /// Подключились, но ответа протокола нет.
+    Foreign,
+}
+
+fn forward(addr: &SocketAddr, paths: &[PathBuf]) -> Forward {
+    let Ok(mut s) = TcpStream::connect_timeout(addr, Duration::from_millis(300)) else { return Forward::Refused };
+    let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
+    let _ = s.set_write_timeout(Some(Duration::from_secs(2)));
+    let mut text = format!("{MAGIC}\n");
+    for p in paths {
+        text.push_str(&p.to_string_lossy());
+        text.push('\n');
+    }
+    if s.write_all(text.as_bytes()).is_err() {
+        return Forward::Foreign;
+    }
+    let _ = s.shutdown(Shutdown::Write);
+    let mut reply = String::new();
+    if s.read_to_string(&mut reply).is_ok() && reply.trim() == "OK" { Forward::Delivered } else { Forward::Foreign }
+}
+
 /// Принимает пути от других экземпляров и передаёт пачками в `on_batch`.
 pub fn serve(listener: TcpListener, on_batch: impl Fn(Vec<PathBuf>) + Send + 'static) {
     std::thread::spawn(move || {
-        for stream in listener.incoming().flatten() {
-            let mut stream = stream;
+        for mut stream in listener.incoming().flatten() {
             let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
             let mut text = String::new();
-            if stream.read_to_string(&mut text).is_ok() || !text.is_empty() {
-                let batch: Vec<PathBuf> = text.lines().filter(|l| !l.is_empty()).map(PathBuf::from).collect();
-                if !batch.is_empty() {
-                    on_batch(batch);
-                }
+            let _ = stream.read_to_string(&mut text);
+            let mut lines = text.lines();
+            if lines.next() != Some(MAGIC) {
+                continue;
             }
+            let batch: Vec<PathBuf> = lines.filter(|l| !l.is_empty()).map(PathBuf::from).collect();
+            if !batch.is_empty() {
+                on_batch(batch);
+            }
+            let _ = stream.write_all(b"OK");
         }
     });
 }
@@ -72,22 +104,54 @@ pub fn hide_window(cmd: &mut Command) -> &mut Command {
     cmd
 }
 
+// ───────────────────────── контекстное меню ─────────────────────────
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MenuState {
+    NotInstalled,
+    /// Пункт есть и указывает на эту копию программы.
+    Installed,
+    /// Пункт есть, но указывает на другой (перенесённый/удалённый) exe.
+    Stale,
+}
+
 fn key_for(ext: &str) -> String {
     format!(r"HKCU\Software\Classes\SystemFileAssociations\.{ext}\shell\{MENU_KEY}")
 }
 
-fn reg(args: &[&str]) -> Result<bool> {
+fn reg(args: &[&str]) -> Result<std::process::Output> {
     let mut cmd = Command::new("reg");
     hide_window(&mut cmd);
-    Ok(cmd.args(args).output()?.status.success())
+    Ok(cmd.args(args).output()?)
 }
 
 pub fn menu_supported() -> bool {
     cfg!(windows)
 }
 
-pub fn menu_installed() -> bool {
-    cfg!(windows) && reg(&["query", &key_for("docx")]).unwrap_or(false)
+fn command_line(exe: &Path) -> String {
+    format!("\"{}\" \"%1\"", exe.display())
+}
+
+pub fn menu_state() -> MenuState {
+    if !cfg!(windows) {
+        return MenuState::NotInstalled;
+    }
+    let mut state = MenuState::NotInstalled;
+    let Ok(exe) = std::env::current_exe() else { return state };
+    let want = command_line(&exe).to_lowercase();
+    for ext in EXTS {
+        let Ok(out) = reg(&["query", &format!(r"{}\command", key_for(ext)), "/ve"]) else { continue };
+        if !out.status.success() {
+            continue;
+        }
+        let text = String::from_utf8_lossy(&out.stdout).to_lowercase();
+        if text.contains(&want) {
+            return MenuState::Installed;
+        }
+        state = MenuState::Stale;
+    }
+    state
 }
 
 /// Добавляет пункт «Объединить файлы…» в меню файлов Excel/Word (для текущего пользователя).
@@ -96,18 +160,20 @@ pub fn install_menu() -> Result<()> {
         bail!("контекстное меню поддерживается только в Windows");
     }
     let exe = std::env::current_exe()?;
-    let exe = exe.to_string_lossy();
-    let command = format!("\"{exe}\" \"%1\"");
-    let icon = format!("\"{exe}\",0");
+    let command = command_line(&exe);
+    let icon = format!("\"{}\",0", exe.display());
     for ext in EXTS {
         let key = key_for(ext);
         let cmd_key = format!(r"{key}\command");
-        let ok = reg(&["add", &key, "/ve", "/d", "Объединить файлы…", "/f"])?
-            && reg(&["add", &key, "/v", "Icon", "/d", &icon, "/f"])?
-            && reg(&["add", &cmd_key, "/ve", "/d", &command, "/f"])?;
+        let ok = reg(&["add", &key, "/ve", "/d", MENU_LABEL, "/f"])?.status.success()
+            && reg(&["add", &key, "/v", "Icon", "/d", &icon, "/f"])?.status.success()
+            && reg(&["add", &cmd_key, "/ve", "/d", &command, "/f"])?.status.success();
         if !ok {
-            bail!("не удалось записать в реестр (.{ext})");
+            bail!("не удалось записать пункт меню в реестр (.{ext})");
         }
+    }
+    if menu_state() != MenuState::Installed {
+        bail!("пункт меню записан, но проверка не прошла");
     }
     Ok(())
 }
@@ -117,8 +183,11 @@ pub fn uninstall_menu() -> Result<()> {
         bail!("контекстное меню поддерживается только в Windows");
     }
     for ext in EXTS {
-        // Код возврата игнорируем: ключа может уже не быть.
-        let _ = reg(&["delete", &key_for(ext), "/f"]);
+        let key = key_for(ext);
+        // Не удалось удалить, но ключ ещё есть — ошибка; ключа уже нет — всё в порядке.
+        if !reg(&["delete", &key, "/f"])?.status.success() && reg(&["query", &key])?.status.success() {
+            bail!("не удалось удалить пункт меню (.{ext})");
+        }
     }
     Ok(())
 }
@@ -149,7 +218,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn second_instance_forwards_paths() {
+    fn second_instance_forwards_paths_with_ack() {
         let Role::Primary(l) = claim(&[]) else { panic!("порт должен быть свободен") };
         let (tx, rx) = std::sync::mpsc::channel();
         serve(l, move |b| tx.send(b).unwrap());

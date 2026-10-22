@@ -1,436 +1,154 @@
 #![cfg_attr(all(not(debug_assertions), windows), windows_subsystem = "windows")]
 
+mod app;
+mod config;
 mod excel;
+mod job;
 mod pdf;
 mod shell;
 mod word;
 
 use eframe::egui;
-use std::path::{Path, PathBuf};
-use std::sync::mpsc::{Receiver, channel};
+use job::{Job, JobEntry, Kind, Target};
+use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
+use std::sync::mpsc::channel;
 
-#[derive(Clone, Copy, PartialEq)]
-enum Kind {
-    Excel,
-    Word,
+const USAGE: &str = "Использование:
+  merge-files                         — открыть окно
+  merge-files файл1 файл2 …           — открыть окно с этими файлами
+  merge-files -o РЕЗУЛЬТАТ файл1 …    — объединить без окна (тип по расширению: .xlsx, .docx или .pdf)
+  merge-files --install-menu          — добавить пункт в контекстное меню проводника (Windows)
+  merge-files --uninstall-menu        — убрать пункт из контекстного меню";
+
+/// Вывод сообщений: в Windows release-сборке у процесса нет консоли — подключаемся к родительской.
+fn say(msg: &str) {
+    #[cfg(windows)]
+    {
+        use std::io::Write;
+        unsafe extern "system" {
+            fn AttachConsole(pid: u32) -> i32;
+        }
+        // SAFETY: простой вызов Win32 без указателей; (u32::MAX) = ATTACH_PARENT_PROCESS.
+        if unsafe { AttachConsole(u32::MAX) } != 0 {
+            if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open("CONOUT$") {
+                let _ = writeln!(f, "{msg}");
+                return;
+            }
+        }
+        // Консоли нет (запуск из проводника) — показываем окно сообщения.
+        rfd::MessageDialog::new().set_title("Merge Files").set_description(msg).show();
+    }
+    #[cfg(not(windows))]
+    eprintln!("{msg}");
 }
 
-impl Kind {
-    fn of(path: &Path) -> Option<Kind> {
-        match path.extension()?.to_str()?.to_lowercase().as_str() {
-            "xlsx" | "xlsm" | "xls" | "ods" => Some(Kind::Excel),
-            "docx" | "doc" => Some(Kind::Word),
-            _ => None,
-        }
-    }
-    fn ext(self) -> &'static str {
-        match self {
-            Kind::Excel => "xlsx",
-            Kind::Word => "docx",
-        }
-    }
+fn absolute(p: PathBuf) -> PathBuf {
+    std::path::absolute(&p).unwrap_or(p)
 }
 
-#[derive(Clone, Copy, PartialEq)]
-enum Target {
-    Same,
-    Pdf,
-}
-
-struct Entry {
-    path: PathBuf,
-    sheets: Vec<(String, bool)>,
-}
-
-struct App {
-    entries: Vec<Entry>,
-    kind: Option<Kind>,
-    target: Target,
-    status: String,
-    is_error: bool,
-    rx: Option<Receiver<Result<PathBuf, String>>>,
-    incoming: Option<Receiver<Vec<PathBuf>>>,
-    menu_installed: bool,
-    show_settings: bool,
-}
-
-impl App {
-    fn new() -> Self {
-        App { entries: vec![], kind: None, target: Target::Same, status: String::new(), is_error: false, rx: None, incoming: None, menu_installed: shell::menu_installed(), show_settings: false }
-    }
-
-    fn error(&mut self, msg: String) {
-        self.status = msg;
-        self.is_error = true;
-    }
-
-    fn add(&mut self, paths: Vec<PathBuf>) {
-        for path in paths {
-            let Some(k) = Kind::of(&path) else {
-                self.error(format!("Неподдерживаемый файл: {}", path.display()));
-                continue;
-            };
-            if self.kind.is_some_and(|cur| cur != k) {
-                self.error("Нельзя смешивать Excel и Word в одном объединении".into());
-                continue;
-            }
-            let sheets = if k == Kind::Excel {
-                match excel::list_sheets(&path) {
-                    Ok(s) => s.into_iter().map(|n| (n, true)).collect(),
-                    Err(e) => {
-                        self.error(format!("{e:#}"));
-                        continue;
-                    }
-                }
-            } else {
-                vec![]
-            };
-            self.kind = Some(k);
-            self.entries.push(Entry { path, sheets });
-        }
-        if self.entries.is_empty() {
-            self.kind = None;
-        }
-    }
-
-    /// Файлы из контекстного меню: добавляем и упорядочиваем по имени (естественная сортировка).
-    fn add_from_shell(&mut self, paths: Vec<PathBuf>) {
-        self.add(paths);
-        self.entries.sort_by_key(|e| shell::natural_key(&e.path.file_name().unwrap_or_default().to_string_lossy()));
-    }
-
-    fn merge(&mut self, ctx: &egui::Context) {
-        let Some(kind) = self.kind else { return };
-        let (ext, filter) = match self.target {
-            Target::Same => (kind.ext(), kind.ext()),
-            Target::Pdf => ("pdf", "pdf"),
-        };
-        let Some(out) = rfd::FileDialog::new()
-            .set_file_name(format!("merged.{ext}"))
-            .add_filter(filter, &[ext])
-            .save_file()
-        else {
-            return;
-        };
-        let target = self.target;
-        let entries: Vec<(PathBuf, Vec<String>)> = self
-            .entries
-            .iter()
-            .map(|e| (e.path.clone(), e.sheets.iter().filter(|s| s.1).map(|s| s.0.clone()).collect()))
-            .collect();
-        let (tx, rx) = channel();
-        self.rx = Some(rx);
-        self.status = "Объединение…".into();
-        self.is_error = false;
-        let ctx = ctx.clone();
-        std::thread::spawn(move || {
-            let r = run(kind, target, entries, &out).map(|_| out).map_err(|e| format!("{e:#}"));
-            let _ = tx.send(r);
-            ctx.request_repaint();
-        });
-    }
-}
-
-fn run(kind: Kind, target: Target, entries: Vec<(PathBuf, Vec<String>)>, out: &Path) -> anyhow::Result<()> {
-    let tmp = tempfile::tempdir()?;
-    // Промежуточный файл того же типа; для PDF он конвертируется через LibreOffice.
-    let merged = match target {
-        Target::Same => out.to_path_buf(),
-        Target::Pdf => tmp.path().join(format!("merged.{}", kind.ext())),
-    };
-    match kind {
-        Kind::Excel => {
-            let mut sources = vec![];
-            for (path, sheets) in entries.into_iter().filter(|(_, s)| !s.is_empty()) {
-                // Форматы кроме xlsx/xlsm (xls, ods) сначала конвертируются в xlsx.
-                let native = path
-                    .extension()
-                    .is_some_and(|e| e.eq_ignore_ascii_case("xlsx") || e.eq_ignore_ascii_case("xlsm"));
-                let path = if native {
-                    path
-                } else {
-                    let dir = tmp.path().join(format!("in{}", sources.len()));
-                    std::fs::create_dir_all(&dir)?;
-                    pdf::convert(&path, "xlsx", &dir)?
-                };
-                sources.push(excel::Source { path, sheets });
-            }
-            excel::merge(&sources, &merged)?;
-        }
-        Kind::Word => {
-            let mut docs = vec![];
-            for (i, (path, _)) in entries.into_iter().enumerate() {
-                if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("doc")) {
-                    let dir = tmp.path().join(format!("in{i}"));
-                    std::fs::create_dir_all(&dir)?;
-                    docs.push(pdf::convert(&path, "docx", &dir)?);
-                } else {
-                    docs.push(path);
-                }
-            }
-            word::merge(&docs, &merged)?;
-        }
-    }
-    if target == Target::Pdf {
-        let dir = tmp.path().join("pdf");
-        std::fs::create_dir_all(&dir)?;
-        let result = pdf::convert(&merged, "pdf", &dir)?;
-        std::fs::copy(result, out)?;
-    }
-    Ok(())
-}
-
-impl App {
-    fn settings_window(&mut self, ctx: &egui::Context) {
-        let mut open = self.show_settings;
-        egui::Window::new("Настройки").open(&mut open).collapsible(false).resizable(false).show(ctx, |ui| {
-            ui.strong("Интеграция с проводником");
-            let mut on = self.menu_installed;
-            let resp = ui.add_enabled(
-                shell::menu_supported(),
-                egui::Checkbox::new(&mut on, "Пункт «Объединить файлы…» в контекстном меню"),
-            );
-            if resp.changed() {
-                let r = if on { shell::install_menu() } else { shell::uninstall_menu() };
-                self.menu_installed = shell::menu_installed();
-                match r {
-                    Ok(()) => {
-                        self.status = if on { "Пункт добавлен в контекстное меню" } else { "Пункт удалён из контекстного меню" }.into();
-                        self.is_error = false;
-                    }
-                    Err(e) => self.error(format!("{e:#}")),
-                }
-            }
-            if shell::menu_supported() {
-                ui.weak("Файлы Excel и Word → ПКМ → «Объединить файлы…». Права администратора не нужны.");
-                ui.weak("Windows 11: пункт в «Показать дополнительные параметры». Если переместите exe — включите заново.");
-            } else {
-                ui.weak("Доступно только в Windows.");
-            }
-        });
-        self.show_settings = open;
-    }
-}
-
-impl eframe::App for App {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let ctx = ui.ctx().clone();
-
-        let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| Some(f.path().to_path_buf())).collect());
-        if !dropped.is_empty() {
-            self.add(dropped);
-        }
-        let mut batches = vec![];
-        if let Some(rx) = &self.incoming {
-            while let Ok(b) = rx.try_recv() {
-                batches.push(b);
-            }
-        }
-        if !batches.is_empty() {
-            for b in batches {
-                self.add_from_shell(b);
-            }
-            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-        }
-        if let Some(rx) = &self.rx {
-            if let Ok(r) = rx.try_recv() {
-                match r {
-                    Ok(p) => {
-                        self.status = format!("Готово: {}", p.display());
-                        self.is_error = false;
-                    }
-                    Err(e) => self.error(e),
-                }
-                self.rx = None;
-            }
-        }
-        let busy = self.rx.is_some();
-
-        egui::Panel::bottom("bottom").show(ui, |ui| {
-            ui.add_space(6.0);
-            let color = if self.is_error { egui::Color32::LIGHT_RED } else { egui::Color32::LIGHT_GREEN };
-            ui.horizontal(|ui| {
-                if busy {
-                    ui.spinner();
-                }
-                ui.colored_label(color, &self.status);
-            });
-            ui.add_space(6.0);
-        });
-
-        egui::CentralPanel::default().show(ui, |ui| {
-            ui.heading("Объединение файлов");
-            ui.label("Листы Excel или документы Word — в один файл того же типа или в PDF.");
-            ui.add_space(8.0);
-
-            ui.horizontal(|ui| {
-                if ui.add_enabled(!busy, egui::Button::new("➕ Добавить файлы…")).clicked() {
-                    if let Some(p) = rfd::FileDialog::new()
-                        .add_filter("Excel / Word", &["xlsx", "xlsm", "xls", "ods", "docx", "doc"])
-                        .pick_files()
-                    {
-                        self.add(p);
-                    }
-                }
-                if ui.add_enabled(!busy && !self.entries.is_empty(), egui::Button::new("Очистить")).clicked() {
-                    self.entries.clear();
-                    self.kind = None;
-                }
-                ui.label("или перетащите файлы в окно");
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("⚙ Настройки").clicked() {
-                        self.show_settings = true;
-                        self.menu_installed = shell::menu_installed();
-                    }
-                });
-            });
-            ui.separator();
-
-            let mut action: Option<(usize, i8)> = None; // -1 вверх, 1 вниз, 0 удалить
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                if self.entries.is_empty() {
-                    ui.weak("Файлы не выбраны");
-                }
-                let n = self.entries.len();
-                for (i, e) in self.entries.iter_mut().enumerate() {
-                    ui.horizontal(|ui| {
-                        ui.label(format!("{}.", i + 1));
-                        let name = e.path.file_name().unwrap_or_default().to_string_lossy();
-                        ui.strong(name.as_ref()).on_hover_text(e.path.display().to_string());
-                        if ui.add_enabled(i > 0, egui::Button::new("⬆")).clicked() {
-                            action = Some((i, -1));
-                        }
-                        if ui.add_enabled(i + 1 < n, egui::Button::new("⬇")).clicked() {
-                            action = Some((i, 1));
-                        }
-                        if ui.button("✖").clicked() {
-                            action = Some((i, 0));
-                        }
-                    });
-                    if !e.sheets.is_empty() {
-                        ui.indent(("sheets", i), |ui| {
-                            for (name, on) in &mut e.sheets {
-                                ui.checkbox(on, name.as_str());
-                            }
-                        });
-                    }
-                }
-            });
-            if !busy {
-                if let Some((i, a)) = action {
-                    match a {
-                        -1 => self.entries.swap(i, i - 1),
-                        1 => self.entries.swap(i, i + 1),
-                        _ => {
-                            self.entries.remove(i);
-                            if self.entries.is_empty() {
-                                self.kind = None;
-                            }
-                        }
-                    }
-                }
-            }
-        });
-
-        self.settings_window(&ctx);
-
-        egui::Panel::bottom("controls").show(ui, |ui| {
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                ui.label("Результат:");
-                let same = self.kind.map(|k| match k {
-                    Kind::Excel => "Excel (.xlsx)",
-                    Kind::Word => "Word (.docx)",
-                });
-                ui.radio_value(&mut self.target, Target::Same, same.unwrap_or("Тот же формат"));
-                ui.radio_value(&mut self.target, Target::Pdf, "PDF");
-            });
-            ui.add_space(4.0);
-            let ready = self.kind.is_some_and(|k| match k {
-                Kind::Excel => self.entries.iter().any(|e| e.sheets.iter().any(|s| s.1)),
-                Kind::Word => !self.entries.is_empty(),
-            });
-            if ui.add_enabled(ready && !busy, egui::Button::new("Объединить…").min_size([160.0, 32.0].into())).clicked() {
-                self.merge(&ctx);
-            }
-            if self.target == Target::Pdf || self.entries.iter().any(|e| e.path.extension().is_some_and(|x| x == "doc")) {
-                ui.weak("PDF, .doc, .xls и .ods требуют LibreOffice (в Windows подойдёт и Microsoft Office).");
-            }
-        });
-    }
-}
-
-/// Консольный режим: `merge-files -o OUT in1 in2 ...` (тип результата по расширению OUT).
+/// Консольный режим: `merge-files -o OUT in1 in2 ...`.
 fn cli(args: Vec<String>) -> anyhow::Result<()> {
     let mut out = None;
     let mut inputs = vec![];
     let mut it = args.into_iter();
     while let Some(a) = it.next() {
         if a == "-o" {
-            out = it.next().map(PathBuf::from);
+            out = it.next().map(|p| absolute(PathBuf::from(p)));
         } else {
-            inputs.push(PathBuf::from(a));
+            inputs.push(absolute(PathBuf::from(a)));
         }
     }
-    let out = out.ok_or_else(|| anyhow::anyhow!("использование: merge-files -o OUT файл1 файл2 …"))?;
-    let kind = inputs.first().and_then(|p| Kind::of(p)).ok_or_else(|| anyhow::anyhow!("нужны файлы xlsx/docx"))?;
+    let out = out.ok_or_else(|| anyhow::anyhow!("не указан файл результата (-o)\n\n{USAGE}"))?;
+    let kind = inputs
+        .first()
+        .and_then(|p| Kind::of(p))
+        .ok_or_else(|| anyhow::anyhow!("нужны файлы .xlsx/.xls/.ods или .docx/.doc"))?;
+    if let Some(bad) = inputs.iter().find(|p| Kind::of(p) != Some(kind)) {
+        anyhow::bail!("«{}» — другой тип файла, чем первый", bad.display());
+    }
     let target = if out.extension().is_some_and(|e| e.eq_ignore_ascii_case("pdf")) { Target::Pdf } else { Target::Same };
     let entries = inputs
         .into_iter()
         .map(|p| {
-            let sheets = if kind == Kind::Excel { excel::list_sheets(&p)? } else { vec![] };
-            Ok((p, sheets))
+            let all_sheets: Vec<String> =
+                if kind == Kind::Excel { excel::list_sheets(&p)?.into_iter().map(|s| s.name).collect() } else { vec![] };
+            let selected = (0..all_sheets.len()).collect();
+            Ok(JobEntry { path: p, all_sheets, selected })
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
-    run(kind, target, entries, &out)
+    let job = Job { kind, target, entries, out };
+    let cancel = AtomicBool::new(false);
+    let outcome = job::run(&job, &cancel, &|m| say(m))?;
+    for w in outcome.warnings {
+        say(&format!("Предупреждение: {w}"));
+    }
+    say(&format!("Готово: {}", job.out.display()));
+    Ok(())
+}
+
+fn finish(r: anyhow::Result<()>) -> eframe::Result {
+    if let Err(e) = r {
+        say(&format!("Ошибка: {e:#}"));
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 fn main() -> eframe::Result {
+    std::panic::set_hook(Box::new(|info| {
+        let thread = std::thread::current();
+        config::log(&format!("panic в потоке {:?}: {info}", thread.name().unwrap_or("?")));
+    }));
+
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
-        Some("--install-menu") => return cli_result(shell::install_menu()),
-        Some("--uninstall-menu") => return cli_result(shell::uninstall_menu()),
-        _ if args.iter().any(|a| a == "-o") => return cli_result(cli(args)),
+        Some("--help" | "-h" | "/?") => {
+            say(USAGE);
+            return Ok(());
+        }
+        Some("--install-menu") => return finish(shell::install_menu().map(|_| say("Пункт меню добавлен"))),
+        Some("--uninstall-menu") => return finish(shell::uninstall_menu().map(|_| say("Пункт меню удалён"))),
+        _ if args.iter().any(|a| a == "-o") => return finish(cli(args)),
         _ => {}
     }
 
     // Остальные аргументы — файлы (запуск из контекстного меню).
-    let initial: Vec<PathBuf> = args.into_iter().map(PathBuf::from).collect();
+    let initial: Vec<PathBuf> = args.into_iter().map(|a| absolute(PathBuf::from(a))).collect();
     let listener = match shell::claim(&initial) {
         shell::Role::Forwarded => return Ok(()),
         shell::Role::Primary(l) => Some(l),
         shell::Role::Standalone => None,
     };
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([560.0, 540.0]).with_drag_and_drop(true),
-        ..Default::default()
-    };
-    eframe::run_native(
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title("Merge Files")
+        .with_inner_size([580.0, 600.0])
+        .with_min_inner_size([460.0, 420.0])
+        .with_drag_and_drop(true);
+    if let Ok(icon) = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon_window.png")) {
+        viewport = viewport.with_icon(icon);
+    }
+    let options = eframe::NativeOptions { viewport, ..Default::default() };
+    let res = eframe::run_native(
         "Merge Files",
         options,
         Box::new(move |cc| {
-            let mut app = App::new();
-            if let Some(l) = listener {
+            let incoming = listener.map(|l| {
                 let (tx, rx) = channel();
                 let ctx = cc.egui_ctx.clone();
                 shell::serve(l, move |batch| {
                     let _ = tx.send(batch);
                     ctx.request_repaint();
                 });
-                app.incoming = Some(rx);
-            }
-            if !initial.is_empty() {
-                app.add_from_shell(initial);
-            }
-            Ok(Box::new(app))
+                rx
+            });
+            Ok(Box::new(app::App::new(cc, incoming, initial)))
         }),
-    )
-}
-
-fn cli_result(r: anyhow::Result<()>) -> eframe::Result {
-    if let Err(e) = r {
-        eprintln!("Ошибка: {e:#}");
-        std::process::exit(1);
+    );
+    if let Err(e) = &res {
+        let msg = format!("Не удалось запустить окно программы: {e}");
+        config::log(&msg);
+        say(&msg);
     }
-    Ok(())
+    res
 }

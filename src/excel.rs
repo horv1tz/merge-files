@@ -8,10 +8,24 @@ use calamine::{Reader, open_workbook_auto};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+pub struct SheetInfo {
+    pub name: String,
+    pub hidden: bool,
+}
+
+#[derive(Default)]
+pub struct Options {
+    pub fit_to_width: bool,
+}
+
 /// Список листов книги.
-pub fn list_sheets(path: &Path) -> Result<Vec<String>> {
+pub fn list_sheets(path: &Path) -> Result<Vec<SheetInfo>> {
     let wb = open_workbook_auto(path).with_context(|| format!("не удалось открыть {}", path.display()))?;
-    Ok(wb.sheet_names())
+    Ok(wb
+        .sheets_metadata()
+        .iter()
+        .map(|m| SheetInfo { name: m.name.clone(), hidden: m.visible != calamine::SheetVisible::Visible })
+        .collect())
 }
 
 /// Файл и имена листов, которые нужно взять из него.
@@ -20,7 +34,7 @@ pub struct Source {
     pub sheets: Vec<String>,
 }
 
-pub fn merge(sources: &[Source], out: &Path) -> Result<()> {
+pub fn merge(sources: &[Source], out: &Path, _opts: &Options) -> Result<Vec<String>> {
     let mut base: Option<umya_spreadsheet::Workbook> = None;
     let mut used: HashSet<String> = HashSet::new();
 
@@ -69,7 +83,7 @@ pub fn merge(sources: &[Source], out: &Path) -> Result<()> {
     book.set_active_sheet(0);
     umya_spreadsheet::writer::xlsx::write(&book, out)
         .map_err(|e| anyhow!("не удалось сохранить {}: {e:?}", out.display()))?;
-    Ok(())
+    Ok(vec![])
 }
 
 /// Имя листа Excel: до 31 символа, без `[]:*?/\`, уникальное без учёта регистра.
@@ -117,7 +131,7 @@ mod tests {
         make(&a, "first");
         make(&b, "second");
         let src = |p: &PathBuf| Source { path: p.clone(), sheets: vec!["Sheet1".into()] };
-        merge(&[src(&a), src(&b)], &out).unwrap();
+        merge(&[src(&a), src(&b)], &out, &Options::default()).unwrap();
         let book = umya_spreadsheet::reader::xlsx::read(&out).unwrap();
         let names: Vec<_> = book.sheet_collection().iter().map(|s| s.name().to_string()).collect();
         assert_eq!(names, ["Sheet1", "b_Sheet1"]);
