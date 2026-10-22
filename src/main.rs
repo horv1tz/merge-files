@@ -91,7 +91,18 @@ fn cli(args: Vec<OsString>) -> anyhow::Result<()> {
     let entries = inputs
         .into_iter()
         .map(|p| {
-            let sheets = if kind == Kind::Excel { excel::list_sheets(&p)? } else { vec![] };
+            let sheets = if kind == Kind::Excel {
+                match excel::list_sheets(&p) {
+                    Ok(s) => s,
+                    // HTML/XML-выгрузка под видом .xls: листы определятся после конвертации.
+                    Err(_) if job::sniff(&p).is_ok_and(|f| f == job::Sniffed::Text) => {
+                        vec![excel::SheetInfo { name: "Данные".into(), hidden: false }]
+                    }
+                    Err(e) => return Err(e),
+                }
+            } else {
+                vec![]
+            };
             let all_sheets: Vec<String> = sheets.iter().map(|s| s.name.clone()).collect();
             // Как и в окне: скрытые листы по умолчанию не берём (если скрыты все — берём все).
             let mut selected: Vec<usize> = (0..sheets.len()).filter(|&i| !sheets[i].hidden).collect();
